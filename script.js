@@ -91,6 +91,15 @@
         destinationMenuReady: false,
 
         /*
+         * Capture des objets métier SERVICE_OBJECT
+         */
+        serviceObjectCaptureActive: false,
+        serviceObjectCaptureLabel: "",
+        serviceObjectCaptureStartedAt: 0,
+        serviceObjectCaptures: [],
+        lastServiceObject: null,
+
+        /*
          * Diagnostics
          */
         callerErrors: []
@@ -99,6 +108,7 @@
     w.__AVA_V11 = state;
 
     const seenWalkActions = new WeakSet();
+    let seenServiceObjects = new WeakSet();
 
     /*
      * ============================================================
@@ -308,6 +318,487 @@
 
         return result;
     }
+
+    /*
+     * ============================================================
+     * SERVICE OBJECT CAPTURE
+     * ============================================================
+     * Workflow conseillé :
+     * __AVA_GO_YARD__()
+     * __AVA_SERVICE_START__("yard-object")
+     * __AVA_ACTION_START__("yard-object")
+     * __AVA_NET_START__("yard-object")
+     * __AVA_UI_START__("yard-object", 8000)
+     * // Cliquer exactement un objet de tâche puis attendre la fin.
+     * __AVA_SERVICE_STOP__()
+     * __AVA_ACTION_STOP__()
+     * __AVA_NET_STOP__()
+     * __AVA_UI_STOP__()
+     * __AVA_SERVICE_LIST__()
+     * const obj = __AVA_SERVICE_LAST__()
+     * obj
+     * obj.objectId
+     * obj.shopItem
+     * obj.shopItem.typeId
+     * Object.getOwnPropertyNames(obj)
+     * Object.getOwnPropertyNames(Object.getPrototypeOf(obj))
+     */
+
+    function safeReadProperty(object, key) {
+        try {
+            return object?.[key];
+        } catch {
+            return undefined;
+        }
+    }
+
+    function safePropertyNames(object) {
+        try {
+            if (!object || typeof object !== "object") {
+                return [];
+            }
+
+            return Object.getOwnPropertyNames(object);
+        } catch {
+            return [];
+        }
+    }
+
+    function safePrototypePropertyNames(object) {
+        try {
+            const prototype =
+                Object.getPrototypeOf(object);
+
+            if (!prototype) {
+                return [];
+            }
+
+            return Object.getOwnPropertyNames(prototype);
+        } catch {
+            return [];
+        }
+    }
+
+    function safeObjectType(object) {
+        try {
+            const tag =
+                Object.prototype.toString.call(object);
+
+            const constructorName =
+                object?.constructor?.name;
+
+            if (constructorName) {
+                return `${constructorName} ${tag}`;
+            }
+
+            return tag;
+        } catch {
+            return "[type illisible]";
+        }
+    }
+
+    function simpleScalar(value) {
+        return (
+            value === null ||
+            value === undefined ||
+            typeof value === "string" ||
+            typeof value === "number" ||
+            typeof value === "boolean"
+        );
+    }
+
+    function describeObjectShallow(object) {
+        const description = {
+            type: safeObjectType(object),
+            ownPropertyNames: safePropertyNames(object),
+            prototypePropertyNames: safePrototypePropertyNames(object),
+            fields: {}
+        };
+
+        const scalarFields = [
+            "objectId",
+            "id",
+            "typeId",
+            "state",
+            "serviced",
+            "enabled",
+            "active",
+            "x",
+            "y"
+        ];
+
+        for (const field of scalarFields) {
+            const value =
+                safeReadProperty(object, field);
+
+            if (simpleScalar(value)) {
+                description.fields[field] = value;
+            }
+        }
+
+        return description;
+    }
+
+    function serviceCandidateInfo(value) {
+        if (!value || typeof value !== "object") {
+            return null;
+        }
+
+        try {
+            const objectId =
+                safeReadProperty(value, "objectId");
+
+            const shopItem =
+                safeReadProperty(value, "shopItem");
+
+            const shopItemTypeId =
+                safeReadProperty(shopItem, "typeId");
+
+            if (
+                objectId === undefined ||
+                !shopItem ||
+                shopItemTypeId === undefined
+            ) {
+                return null;
+            }
+
+            return {
+                objectId,
+                shopItem,
+                shopItemTypeId
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    function collectServiceCandidates(
+        value,
+        depth = 0,
+        seen = new WeakSet(),
+        candidates = []
+    ) {
+        if (
+            depth > 3 ||
+            !value ||
+            typeof value !== "object"
+        ) {
+            return candidates;
+        }
+
+        if (seen.has(value)) {
+            return candidates;
+        }
+
+        seen.add(value);
+
+        const info =
+            serviceCandidateInfo(value);
+
+        if (info) {
+            candidates.push({
+                object: value,
+                info
+            });
+        }
+
+        const keys =
+            Array.from(
+                new Set([
+                    ...safePropertyNames(value),
+                    "object",
+                    "data",
+                    "target",
+                    "currentTarget",
+                    "shopItem",
+                    "event",
+                    "value"
+                ])
+            ).slice(0, 40);
+
+        for (const key of keys) {
+            const child =
+                safeReadProperty(value, key);
+
+            if (child && typeof child === "object") {
+                collectServiceCandidates(
+                    child,
+                    depth + 1,
+                    seen,
+                    candidates
+                );
+            }
+        }
+
+        if (Array.isArray(value)) {
+            for (const child of value.slice(0, 20)) {
+                collectServiceCandidates(
+                    child,
+                    depth + 1,
+                    seen,
+                    candidates
+                );
+            }
+        }
+
+        return candidates;
+    }
+
+    function serviceCaptureSummary(entry) {
+        return {
+            index:
+                entry.index,
+
+            label:
+                entry.label,
+
+            elapsedMs:
+                entry.elapsedMs,
+
+            objectId:
+                entry.objectId,
+
+            shopItemTypeId:
+                entry.shopItemTypeId,
+
+            objectType:
+                entry.objectType,
+
+            shopItemType:
+                entry.shopItemType,
+
+            sourceMethod:
+                entry.sourceMethod,
+
+            eventType:
+                entry.eventType ??
+                null
+        };
+    }
+
+    function serviceCaptureSummaries() {
+        return state.serviceObjectCaptures.map(
+            serviceCaptureSummary
+        );
+    }
+
+    function captureServiceCandidate(candidate, origin = {}) {
+        if (!state.serviceObjectCaptureActive) {
+            return false;
+        }
+
+        const info =
+            candidate?.info ??
+            serviceCandidateInfo(candidate?.object);
+
+        const object =
+            candidate?.object;
+
+        if (!object || !info) {
+            return false;
+        }
+
+        if (seenServiceObjects.has(object)) {
+            return false;
+        }
+
+        seenServiceObjects.add(object);
+        state.lastServiceObject = object;
+
+        const entry = {
+            index:
+                state.serviceObjectCaptures.length,
+
+            label:
+                state.serviceObjectCaptureLabel,
+
+            time:
+                new Date().toISOString(),
+
+            elapsedMs:
+                Math.round(
+                    performance.now() -
+                    state.serviceObjectCaptureStartedAt
+                ),
+
+            objectId:
+                info.objectId,
+
+            shopItemTypeId:
+                info.shopItemTypeId,
+
+            rawObject:
+                object,
+
+            rawShopItem:
+                info.shopItem,
+
+            objectType:
+                safeObjectType(object),
+
+            shopItemType:
+                safeObjectType(info.shopItem),
+
+            objectDescription:
+                describeObjectShallow(object),
+
+            shopItemDescription:
+                describeObjectShallow(info.shopItem),
+
+            sourceMethod:
+                origin.sourceMethod ??
+                null,
+
+            functionSource:
+                origin.functionSource ??
+                null,
+
+            rawArguments:
+                origin.rawArguments ??
+                null,
+
+            rawThis:
+                origin.rawThis ??
+                null,
+
+            stack:
+                origin.stack ??
+                null,
+
+            eventType:
+                origin.eventType ??
+                null,
+
+            rawEvent:
+                origin.rawEvent ??
+                null,
+
+            rawDispatcher:
+                origin.rawDispatcher ??
+                null,
+
+            eventTarget:
+                origin.eventTarget ??
+                null,
+
+            eventCurrentTarget:
+                origin.eventCurrentTarget ??
+                null
+        };
+
+        state.serviceObjectCaptures.push(entry);
+
+        console.log(
+            `[AVA-V12 SERVICE] Objet capturé : objectId=${String(info.objectId)}, typeId=${String(info.shopItemTypeId)}`
+        );
+
+        return true;
+    }
+
+    function inspectServiceObjects(values, origin = {}) {
+        if (!state.serviceObjectCaptureActive) {
+            return false;
+        }
+
+        let captured = false;
+
+        try {
+            for (const value of values) {
+                const candidates =
+                    collectServiceCandidates(value);
+
+                for (const candidate of candidates) {
+                    captured =
+                        captureServiceCandidate(
+                            candidate,
+                            origin
+                        ) ||
+                        captured;
+                }
+            }
+        } catch (error) {
+            console.warn(
+                "[AVA-V12 SERVICE] Inspection impossible",
+                error
+            );
+        }
+
+        return captured;
+    }
+
+    w.__AVA_SERVICE_START__ = function (label = "service-object") {
+        state.serviceObjectCaptures.length = 0;
+        state.lastServiceObject = null;
+        state.serviceObjectCaptureLabel = String(label);
+        state.serviceObjectCaptureStartedAt = performance.now();
+        state.serviceObjectCaptureActive = true;
+        seenServiceObjects = new WeakSet();
+
+        console.log(
+            `[AVA-V12 SERVICE] Capture démarrée : ${label}`
+        );
+
+        return true;
+    };
+
+    w.__AVA_SERVICE_STOP__ = function () {
+        state.serviceObjectCaptureActive = false;
+
+        const summaries =
+            serviceCaptureSummaries();
+
+        console.log(
+            `[AVA-V12 SERVICE] Capture arrêtée : ${summaries.length} objet(s)`
+        );
+
+        return summaries;
+    };
+
+    w.__AVA_SERVICE_LIST__ = function () {
+        const summaries =
+            serviceCaptureSummaries();
+
+        if (summaries.length === 0) {
+            console.warn("[AVA-V12 SERVICE] Aucun objet capturé");
+        }
+
+        console.table(summaries);
+
+        return summaries;
+    };
+
+    w.__AVA_SERVICE_SHOW__ = function (index) {
+        const entry =
+            state.serviceObjectCaptures[
+                Number(index)
+            ];
+
+        if (!entry) {
+            console.warn("[AVA-V12 SERVICE] Aucun objet capturé");
+            return null;
+        }
+
+        console.log(entry);
+        return entry;
+    };
+
+    w.__AVA_SERVICE_LAST__ = function () {
+        if (!state.lastServiceObject) {
+            console.warn("[AVA-V12 SERVICE] Aucun objet capturé");
+            return null;
+        }
+
+        console.log(state.lastServiceObject);
+        return state.lastServiceObject;
+    };
+
+    w.__AVA_SERVICE_CLEAR__ = function () {
+        state.serviceObjectCaptures.length = 0;
+        state.lastServiceObject = null;
+        seenServiceObjects = new WeakSet();
+
+        return true;
+    };
 
     /*
      * ============================================================
@@ -682,6 +1173,27 @@
             };
 
             calls.push(call);
+
+            inspectServiceObjects(
+                args,
+                {
+                    sourceMethod:
+                        call.name,
+
+                    functionSource:
+                        call.source,
+
+                    rawArguments:
+                        args,
+
+                    rawThis:
+                        null,
+
+                    stack:
+                        new Error("Service object inspection").stack ??
+                        null
+                }
+            );
 
             const walkAction =
                 args.find(isWalkAction);
@@ -1274,6 +1786,45 @@
             }
 
             function wrapped(event) {
+                inspectServiceObjects(
+                    [event],
+                    {
+                        sourceMethod:
+                            methodName,
+
+                        functionSource:
+                            functionSource(original),
+
+                        rawArguments:
+                            Array.from(arguments),
+
+                        rawThis:
+                            this,
+
+                        stack:
+                            new Error("Service object event").stack ??
+                            null,
+
+                        eventType:
+                            event?.type ??
+                            null,
+
+                        rawEvent:
+                            event,
+
+                        rawDispatcher:
+                            this,
+
+                        eventTarget:
+                            event?.target ??
+                            null,
+
+                        eventCurrentTarget:
+                            event?.currentTarget ??
+                            null
+                    }
+                );
+
                 if (!state.uiTraceActive) {
                     return original.apply(
                         this,
@@ -2078,6 +2629,10 @@
                 commands: "__AVA_ACTION_START__, __AVA_ACTION_STOP__, __AVA_ACTION_LIST__, __AVA_ACTION_SHOW__, __AVA_ACTION_TEST__"
             },
             {
+                section: "Service object capture",
+                commands: "__AVA_SERVICE_START__, __AVA_SERVICE_STOP__, __AVA_SERVICE_LIST__, __AVA_SERVICE_SHOW__, __AVA_SERVICE_LAST__, __AVA_SERVICE_CLEAR__"
+            },
+            {
                 section: "Status",
                 commands: "__AVA_STATUS__, __AVA_HELP__"
             }
@@ -2125,6 +2680,23 @@
 
                 actionCandidates:
                     state.actionCandidates.length,
+
+                serviceObjectCaptureActive:
+                    state.serviceObjectCaptureActive,
+
+                serviceObjectCaptureLabel:
+                    state.serviceObjectCaptureLabel,
+
+                serviceObjectCaptures:
+                    state.serviceObjectCaptures.length,
+
+                lastServiceObjectId:
+                    serviceCandidateInfo(state.lastServiceObject)?.objectId ??
+                    null,
+
+                lastServiceShopItemTypeId:
+                    serviceCandidateInfo(state.lastServiceObject)?.shopItemTypeId ??
+                    null,
 
                 walksCaptured:
                     state.walks.length,
