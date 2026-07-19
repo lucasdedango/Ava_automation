@@ -114,6 +114,8 @@
 
     const seenWalkActions = new WeakSet();
     let seenServiceObjects = new WeakSet();
+    const cleanerObjectIds = new WeakMap();
+    let cleanerObjectIdCounter = 0;
 
     /*
      * ============================================================
@@ -1225,7 +1227,22 @@
         if (className) {
             parts.push(className);
         }
-        return parts.length > 0 ? parts.join("|") : `object:${Math.random().toString(36).slice(2)}`;
+        if (parts.length > 0) {
+            return parts.join("|");
+        }
+
+        try {
+            if (!cleanerObjectIds.has(object)) {
+                cleanerObjectIds.set(
+                    object,
+                    `object:${++cleanerObjectIdCounter}`
+                );
+            }
+
+            return cleanerObjectIds.get(object);
+        } catch {
+            return "object:unknown";
+        }
     }
 
     function getCurrentLocation() {
@@ -1424,10 +1441,15 @@
             }
             const original = target.finishInteraction;
             function wrappedFinishInteraction() {
-                try {
-                    cleaner._completeInteraction(token, "finishInteraction");
-                } catch {}
-                return original.apply(this, arguments);
+                const result = original.apply(this, arguments);
+
+                setTimeout(() => {
+                    try {
+                        cleaner._completeInteraction(token, "finishInteraction");
+                    } catch {}
+                }, 100);
+
+                return result;
             }
             wrappedFinishInteraction.__AVA_CLEANER_WRAPPED__ = true;
             wrappedFinishInteraction.__AVA_ORIGINAL__ = original;
@@ -1484,6 +1506,7 @@
             _timers: [],
             _attempts: new Map(),
             _skippedObjects: new Set(),
+            _completedObjects: new Set(),
             _wrappedTargets: [],
             _activeAction: null,
             _lastScanTargets: [],
@@ -1510,6 +1533,7 @@
                 this._emptyScans = 0;
                 this._attempts = new Map();
                 this._skippedObjects = new Set();
+                this._completedObjects = new Set();
                 this._lastScanTargets = [];
                 cleanerLog("Started");
                 this._moveToConfiguredMap();
@@ -1570,6 +1594,7 @@
                 return {
                     mapsCleaned: this.visitedMaps.slice(),
                     objectsSucceeded: this.cleanedObjects,
+                    completedObjects: this._completedObjects.size,
                     objectsSkipped: this.failedObjects,
                     attempts: this.totalAttempts,
                     durationMs: this.startedAt ? Math.round(performance.now() - this.startedAt) : 0
@@ -1617,6 +1642,7 @@
                 this._emptyScans = 0;
                 this._attempts = new Map();
                 this._skippedObjects = new Set();
+                this._completedObjects = new Set();
                 this._lastScanTargets = [];
                 this._restoreWrappedTargets();
                 cleanerLog(`Moving to ${mapId}`);
@@ -1672,10 +1698,16 @@
                     cleanerWarn("Interaction already running");
                     return;
                 }
-                const targets = discoverCleanableObjects(this.config).filter(target => !this._skippedObjects.has(stableObjectId(target)));
+                const targets = discoverCleanableObjects(this.config).filter(target => {
+                    const targetId = stableObjectId(target);
+                    return (
+                        !this._completedObjects.has(targetId) &&
+                        !this._skippedObjects.has(targetId)
+                    );
+                });
                 this._lastScanTargets = targets;
                 this.remainingTargets = targets.length;
-                cleanerLog(`${targets.length} targets found`);
+                cleanerLog(`${targets.length} target${targets.length === 1 ? "" : "s"} remaining`);
                 if (targets.length === 0) {
                     this._handleEmptyScan();
                     return;
@@ -1758,10 +1790,6 @@
                     this._completeInteraction(token, "detached");
                     return;
                 }
-                if (avatar && !avatarHasAction(avatar, action) && performance.now() - startedAt > 1000) {
-                    this._completeInteraction(token, "avatar action finished");
-                    return;
-                }
                 if (performance.now() - startedAt > this.config.interactionTimeout) {
                     cleanerWarn(`Interaction timeout: ${targetId}`);
                     this._completeInteraction(token, "timeout", false);
@@ -1783,6 +1811,9 @@
                     restoreFinishInteractionWatch(target);
                 }
                 if (success) {
+                    if (targetId) {
+                        this._completedObjects.add(targetId);
+                    }
                     this.cleanedObjects++;
                     cleanerLog(`Completed ${targetId ?? "object"}`);
                 } else if (targetId) {
@@ -3485,6 +3516,10 @@
 
                 mapCleanerCleanedObjects:
                     w.__AVA_MAP_CLEANER__?.cleanedObjects ??
+                    0,
+
+                mapCleanerCompletedObjects:
+                    w.__AVA_MAP_CLEANER__?._completedObjects?.size ??
                     0,
 
                 currentAvatarCaptured:
