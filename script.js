@@ -100,6 +100,11 @@
         lastServiceObject: null,
 
         /*
+         * Nettoyage automatique des maps
+         */
+        mapCleanerLogs: [],
+
+        /*
          * Diagnostics
          */
         callerErrors: []
@@ -1075,6 +1080,748 @@
                     "[AVA-V12] Destination system ready"
                 );
             }, 500);
+    }
+
+    /*
+     * ============================================================
+     * MAP CLEANER
+     * ============================================================
+     */
+
+    function cleanerLog(message, data = null) {
+        const entry = { time: new Date().toISOString(), message, data };
+        state.mapCleanerLogs.push(entry);
+        if (state.mapCleanerLogs.length > 300) {
+            state.mapCleanerLogs.splice(0, state.mapCleanerLogs.length - 300);
+        }
+        if (data !== null) {
+            console.log(`[AVA CLEANER] ${message}`, data);
+        } else {
+            console.log(`[AVA CLEANER] ${message}`);
+        }
+    }
+
+    function cleanerWarn(message, data = null) {
+        const entry = { time: new Date().toISOString(), warning: true, message, data };
+        state.mapCleanerLogs.push(entry);
+        if (state.mapCleanerLogs.length > 300) {
+            state.mapCleanerLogs.splice(0, state.mapCleanerLogs.length - 300);
+        }
+        if (data !== null) {
+            console.warn(`[AVA CLEANER] ${message}`, data);
+        } else {
+            console.warn(`[AVA CLEANER] ${message}`);
+        }
+    }
+
+    function getLocationAvatarClass() {
+        try {
+            const LocationAvatar = w.penzville?.city?.avatar?.world?.object?.LocationAvatar;
+            return typeof LocationAvatar === "function" ? LocationAvatar : null;
+        } catch {
+            return null;
+        }
+    }
+
+    function getInteractActionClass() {
+        try {
+            const InteractAction = w.penzville?.city?.avatar?.world?.action?.InteractAction;
+            return typeof InteractAction === "function" ? InteractAction : null;
+        } catch {
+            return null;
+        }
+    }
+
+    function rememberCurrentAvatar(avatar) {
+        try {
+            if (!avatar || typeof avatar.addAction !== "function") {
+                return false;
+            }
+            w.__AVA_CURRENT_AVATAR__ = avatar;
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    function installAvatarCapture() {
+        const LocationAvatar = getLocationAvatarClass();
+        if (!LocationAvatar?.prototype) {
+            return false;
+        }
+        const original = LocationAvatar.prototype.addAction;
+        if (typeof original !== "function") {
+            return false;
+        }
+        if (original.__AVA_CLEANER_HOOKED__) {
+            return true;
+        }
+        function wrappedAddAction(action) {
+            rememberCurrentAvatar(this);
+            return original.apply(this, arguments);
+        }
+        wrappedAddAction.__AVA_CLEANER_HOOKED__ = true;
+        wrappedAddAction.__AVA_ORIGINAL__ = original;
+        LocationAvatar.prototype.addAction = wrappedAddAction;
+        cleanerLog("LocationAvatar.addAction hook installed");
+        return true;
+    }
+
+    function uninstallAvatarCapture() {
+        const LocationAvatar = getLocationAvatarClass();
+        try {
+            const addAction = LocationAvatar?.prototype?.addAction;
+            if (addAction?.__AVA_ORIGINAL__) {
+                LocationAvatar.prototype.addAction = addAction.__AVA_ORIGINAL__;
+                return true;
+            }
+        } catch {}
+        return false;
+    }
+
+    function objectClassName(object) {
+        try {
+            return object?.constructor?.name ?? "";
+        } catch {
+            return "";
+        }
+    }
+
+    function objectTypeId(object) {
+        try {
+            return object?.shopItem?.typeId ?? object?.typeId ?? object?.id ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    function objectPositionKey(object) {
+        try {
+            const position = object?.position ?? object?.pos ?? object?.fe ?? null;
+            const x = position?.x ?? object?.x;
+            const y = position?.y ?? object?.y;
+            return x === undefined && y === undefined ? null : `${String(x)},${String(y)}`;
+        } catch {
+            return null;
+        }
+    }
+
+    function stableObjectId(object) {
+        const parts = [];
+        try {
+            if (object?.objectId !== undefined) {
+                parts.push(String(object.objectId));
+            }
+        } catch {}
+        const typeId = objectTypeId(object);
+        const position = objectPositionKey(object);
+        const className = objectClassName(object);
+        if (typeId !== null && typeId !== undefined) {
+            parts.push(String(typeId));
+        }
+        if (position) {
+            parts.push(position);
+        }
+        if (className) {
+            parts.push(className);
+        }
+        return parts.length > 0 ? parts.join("|") : `object:${Math.random().toString(36).slice(2)}`;
+    }
+
+    function getCurrentLocation() {
+        try {
+            return w.penzville?.city?.Context?.currentLocation ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    function currentMapId() {
+        try {
+            const location = getCurrentLocation();
+            return location?.id ?? location?.locationId ?? location?.workLocationId ?? location?.model?.id ?? location?.model?.key ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    function hasWorldReference(object) {
+        try {
+            if (!object || typeof object !== "object" || object.fe == null) {
+                return false;
+            }
+            if (object.parent === null || object.stage === null) {
+                return false;
+            }
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    function callBooleanMethod(object, methodName) {
+        try {
+            if (typeof object?.[methodName] !== "function") {
+                return true;
+            }
+            return object[methodName]() !== false;
+        } catch {
+            return false;
+        }
+    }
+
+    function classOrTypeAllowed(object, config) {
+        const className = objectClassName(object);
+        const typeId = objectTypeId(object);
+        const classes = config.allowedClasses ?? [];
+        const typeIds = config.allowedTypeIds ?? [];
+        if (typeId && typeIds.includes(String(typeId))) {
+            return true;
+        }
+        if (className && classes.includes(className)) {
+            return true;
+        }
+        return classes.length === 0 && typeIds.length === 0;
+    }
+
+    function isCleanableObject(object, config) {
+        try {
+            const hasInteractionApi = typeof object?.getInteractPoint === "function" && typeof object?.startInteraction === "function";
+            const hasQueueApi = typeof object?.readyInteract === "function" && typeof object?.canAddToQueue === "function";
+            if (!hasInteractionApi && !hasQueueApi) {
+                return false;
+            }
+            if (!hasWorldReference(object)) {
+                return false;
+            }
+            if (!callBooleanMethod(object, "readyInteract") || !callBooleanMethod(object, "canAddToQueue")) {
+                return false;
+            }
+            return classOrTypeAllowed(object, config);
+        } catch {
+            return false;
+        }
+    }
+
+    function collectWorldRoots() {
+        const roots = [];
+        const location = getCurrentLocation();
+        try {
+            roots.push(location, location?.world, location?.room, location?.tilespace, location?.display);
+            roots.push(w.penzville?.city?.Context?.world, w.penzville?.city?.Context?.room);
+        } catch {}
+        return roots.filter(Boolean);
+    }
+
+    function collectObjectsFromRoot(root, config) {
+        const found = [];
+        const queue = [{ value: root, depth: 0 }];
+        const seen = new WeakSet();
+        let seenCount = 0;
+        const maxDepth = config.worldScanDepth ?? 5;
+        const maxObjects = config.maxWorldScanObjects ?? 6000;
+        while (queue.length > 0 && seenCount < maxObjects) {
+            const item = queue.shift();
+            const value = item.value;
+            if (!value || typeof value !== "object" || seen.has(value)) {
+                continue;
+            }
+            seen.add(value);
+            seenCount++;
+            if (isCleanableObject(value, config)) {
+                found.push(value);
+            }
+            if (item.depth >= maxDepth) {
+                continue;
+            }
+            if (Array.isArray(value)) {
+                for (const child of value.slice(0, 300)) {
+                    if (child && typeof child === "object") {
+                        queue.push({ value: child, depth: item.depth + 1 });
+                    }
+                }
+                continue;
+            }
+            let keys = [];
+            try {
+                keys = Object.getOwnPropertyNames(value).slice(0, 80);
+            } catch {
+                keys = [];
+            }
+            for (const key of keys) {
+                if (["parent", "stage", "graphics"].includes(key)) {
+                    continue;
+                }
+                try {
+                    const child = value[key];
+                    if (child && typeof child === "object") {
+                        queue.push({ value: child, depth: item.depth + 1 });
+                    }
+                } catch {}
+            }
+        }
+        return found;
+    }
+
+    function uniqueObjects(objects) {
+        const seen = new WeakSet();
+        const result = [];
+        for (const object of objects) {
+            if (object && typeof object === "object" && !seen.has(object)) {
+                seen.add(object);
+                result.push(object);
+            }
+        }
+        return result;
+    }
+
+    function discoverCleanableObjects(config) {
+        const objects = [];
+        for (const root of collectWorldRoots()) {
+            objects.push(...collectObjectsFromRoot(root, config));
+        }
+        return uniqueObjects(objects);
+    }
+
+    function avatarHasAction(avatar, action, depth = 0, seen = new WeakSet()) {
+        if (!avatar || !action || depth > 3 || typeof avatar !== "object") {
+            return false;
+        }
+        if (seen.has(avatar)) {
+            return false;
+        }
+        seen.add(avatar);
+        if (avatar === action) {
+            return true;
+        }
+        let keys = [];
+        try {
+            keys = Object.getOwnPropertyNames(avatar).slice(0, 80);
+        } catch {
+            return false;
+        }
+        for (const key of keys) {
+            try {
+                const value = avatar[key];
+                if (value === action) {
+                    return true;
+                }
+                if (value && typeof value === "object" && avatarHasAction(value, action, depth + 1, seen)) {
+                    return true;
+                }
+            } catch {}
+        }
+        return false;
+    }
+
+    function installFinishInteractionWatch(target, cleaner, token) {
+        try {
+            if (typeof target.finishInteraction !== "function") {
+                return false;
+            }
+            if (target.finishInteraction.__AVA_CLEANER_WRAPPED__) {
+                return true;
+            }
+            const original = target.finishInteraction;
+            function wrappedFinishInteraction() {
+                try {
+                    cleaner._completeInteraction(token, "finishInteraction");
+                } catch {}
+                return original.apply(this, arguments);
+            }
+            wrappedFinishInteraction.__AVA_CLEANER_WRAPPED__ = true;
+            wrappedFinishInteraction.__AVA_ORIGINAL__ = original;
+            target.finishInteraction = wrappedFinishInteraction;
+            cleaner._wrappedTargets.push(target);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    function restoreFinishInteractionWatch(target) {
+        try {
+            if (target?.finishInteraction?.__AVA_ORIGINAL__) {
+                target.finishInteraction = target.finishInteraction.__AVA_ORIGINAL__;
+                return true;
+            }
+        } catch {}
+        return false;
+    }
+
+    function initializeMapCleaner() {
+        installAvatarCapture();
+
+        const cleaner = {
+            config: {
+                maps: ["garbage", "garden", "restaurant", "schoolAvataria", "sculpt"],
+                allowedClasses: ["GarbageObject", "GardenObject", "RestaurantObject"],
+                allowedTypeIds: ["gbTrashEnrg"],
+                interactionTimeout: 40000,
+                scanDelay: 500,
+                emptyScansRequired: 3,
+                emptyScanInterval: 1000,
+                mapLoadTimeout: 30000,
+                mapStableMs: 2500,
+                maxRetriesPerObject: 3,
+                worldScanDepth: 5,
+                maxWorldScanObjects: 6000
+            },
+            running: false,
+            paused: false,
+            busy: false,
+            currentMap: null,
+            currentTarget: null,
+            cleanedObjects: 0,
+            failedObjects: 0,
+            visitedMaps: [],
+            interactionToken: 0,
+            remainingTargets: 0,
+            totalAttempts: 0,
+            startedAt: 0,
+            _mapIndex: 0,
+            _emptyScans: 0,
+            _timers: [],
+            _attempts: new Map(),
+            _skippedObjects: new Set(),
+            _wrappedTargets: [],
+            _activeAction: null,
+            _lastScanTargets: [],
+
+            start(options = {}) {
+                if (this.running) {
+                    cleanerWarn("Already running");
+                    return false;
+                }
+                Object.assign(this.config, options ?? {});
+                installAvatarCapture();
+                this.running = true;
+                this.paused = false;
+                this.busy = false;
+                this.currentTarget = null;
+                this.cleanedObjects = 0;
+                this.failedObjects = 0;
+                this.visitedMaps = [];
+                this.interactionToken = 0;
+                this.remainingTargets = 0;
+                this.totalAttempts = 0;
+                this.startedAt = performance.now();
+                this._mapIndex = 0;
+                this._emptyScans = 0;
+                this._attempts = new Map();
+                this._skippedObjects = new Set();
+                this._lastScanTargets = [];
+                cleanerLog("Started");
+                this._moveToConfiguredMap();
+                return true;
+            },
+
+            stop() {
+                this.running = false;
+                this.paused = false;
+                this._clearTimers();
+                this._restoreWrappedTargets();
+                this.remainingTargets = 0;
+                cleanerLog("Stopped", this._summary());
+                return this.status();
+            },
+
+            pause() {
+                this.paused = true;
+                cleanerLog("Paused");
+                return this.status();
+            },
+
+            resume() {
+                if (!this.running) {
+                    return false;
+                }
+                this.paused = false;
+                this._emptyScans = 0;
+                cleanerLog("Resumed");
+                this._scheduleScan(0);
+                return true;
+            },
+
+            status() {
+                return {
+                    running: this.running,
+                    paused: this.paused,
+                    busy: this.busy,
+                    currentMap: this.currentMap,
+                    currentTarget: this.currentTarget ? stableObjectId(this.currentTarget) : null,
+                    cleanedObjects: this.cleanedObjects,
+                    failedObjects: this.failedObjects,
+                    remainingTargets: this.remainingTargets,
+                    visitedMaps: this.visitedMaps.slice(),
+                    interactionToken: this.interactionToken,
+                    totalAttempts: this.totalAttempts,
+                    durationMs: this.startedAt ? Math.round(performance.now() - this.startedAt) : 0
+                };
+            },
+
+            uninstall() {
+                this.stop();
+                uninstallAvatarCapture();
+                return true;
+            },
+
+            _summary() {
+                return {
+                    mapsCleaned: this.visitedMaps.slice(),
+                    objectsSucceeded: this.cleanedObjects,
+                    objectsSkipped: this.failedObjects,
+                    attempts: this.totalAttempts,
+                    durationMs: this.startedAt ? Math.round(performance.now() - this.startedAt) : 0
+                };
+            },
+
+            _setTimer(callback, delay) {
+                const timer = setTimeout(() => {
+                    this._timers = this._timers.filter(item => item !== timer);
+                    callback();
+                }, delay);
+                this._timers.push(timer);
+                return timer;
+            },
+
+            _clearTimers() {
+                for (const timer of this._timers) {
+                    clearTimeout(timer);
+                }
+                this._timers.length = 0;
+            },
+
+            _restoreWrappedTargets() {
+                for (const target of this._wrappedTargets.splice(0)) {
+                    restoreFinishInteractionWatch(target);
+                }
+            },
+
+            _moveToConfiguredMap() {
+                if (!this.running) {
+                    return;
+                }
+                if (this._mapIndex >= this.config.maps.length) {
+                    this.running = false;
+                    this.busy = false;
+                    this.currentTarget = null;
+                    cleanerLog("All maps completed", this._summary());
+                    return;
+                }
+                const mapId = this.config.maps[this._mapIndex];
+                const previousAvatar = w.__AVA_CURRENT_AVATAR__ ?? null;
+                this.currentMap = mapId;
+                this.currentTarget = null;
+                this.busy = false;
+                this._emptyScans = 0;
+                this._attempts = new Map();
+                this._skippedObjects = new Set();
+                this._lastScanTargets = [];
+                this._restoreWrappedTargets();
+                cleanerLog(`Moving to ${mapId}`);
+                if (typeof w.__AVA_GO_WORK__ === "function") {
+                    w.__AVA_GO_WORK__(mapId);
+                }
+                this._waitForMapLoad(mapId, previousAvatar, performance.now());
+            },
+
+            _waitForMapLoad(mapId, previousAvatar, startedAt) {
+                if (!this.running) {
+                    return;
+                }
+                installAvatarCapture();
+                const avatar = w.__AVA_CURRENT_AVATAR__ ?? null;
+                const targets = discoverCleanableObjects(this.config);
+                const mapMatches = currentMapId() === null || currentMapId() === mapId;
+                const avatarChanged = avatar && avatar !== previousAvatar;
+                const hasObjects = targets.length > 0;
+                if (mapMatches && (avatarChanged || hasObjects)) {
+                    this._setTimer(() => {
+                        const stableTargets = discoverCleanableObjects(this.config);
+                        const stableAvatar = w.__AVA_CURRENT_AVATAR__ ?? null;
+                        if (this.running && stableAvatar && (stableTargets.length > 0 || stableAvatar !== previousAvatar)) {
+                            cleanerLog(`Map loaded: ${mapId}`);
+                            this._scheduleScan(0);
+                        } else {
+                            this._waitForMapLoad(mapId, previousAvatar, startedAt);
+                        }
+                    }, this.config.mapStableMs);
+                    return;
+                }
+                if (performance.now() - startedAt > this.config.mapLoadTimeout) {
+                    cleanerWarn(`Map load timeout: ${mapId}`);
+                    this._scheduleScan(0);
+                    return;
+                }
+                this._setTimer(() => this._waitForMapLoad(mapId, previousAvatar, startedAt), 500);
+            },
+
+            _scheduleScan(delay = this.config.scanDelay) {
+                if (!this.running) {
+                    return;
+                }
+                this._setTimer(() => this._scanAndRun(), delay);
+            },
+
+            _scanAndRun() {
+                if (!this.running || this.paused) {
+                    return;
+                }
+                if (this.busy) {
+                    cleanerWarn("Interaction already running");
+                    return;
+                }
+                const targets = discoverCleanableObjects(this.config).filter(target => !this._skippedObjects.has(stableObjectId(target)));
+                this._lastScanTargets = targets;
+                this.remainingTargets = targets.length;
+                cleanerLog(`${targets.length} targets found`);
+                if (targets.length === 0) {
+                    this._handleEmptyScan();
+                    return;
+                }
+                this._emptyScans = 0;
+                this._startInteraction(targets[0]);
+            },
+
+            _handleEmptyScan() {
+                if (this.busy) {
+                    return;
+                }
+                this._emptyScans++;
+                if (this._emptyScans < this.config.emptyScansRequired) {
+                    this._setTimer(() => this._scanAndRun(), this.config.emptyScanInterval);
+                    return;
+                }
+                const mapId = this.currentMap ?? this.config.maps[this._mapIndex];
+                this.visitedMaps.push(mapId);
+                cleanerLog(`Map complete: ${mapId}`);
+                this._mapIndex++;
+                this._moveToConfiguredMap();
+            },
+
+            _startInteraction(target) {
+                if (this.busy) {
+                    cleanerWarn("Interaction already running");
+                    return false;
+                }
+                const avatar = w.__AVA_CURRENT_AVATAR__ ?? null;
+                const InteractAction = getInteractActionClass();
+                const targetId = stableObjectId(target);
+                if (!avatar || typeof avatar.addAction !== "function" || !InteractAction) {
+                    this._registerFailure(targetId, "missing avatar or InteractAction");
+                    this._scheduleScan(this.config.scanDelay);
+                    return false;
+                }
+                if (!isCleanableObject(target, this.config)) {
+                    this._registerFailure(targetId, "invalid target");
+                    this._scheduleScan(this.config.scanDelay);
+                    return false;
+                }
+                const attempt = (this._attempts.get(targetId) ?? 0) + 1;
+                this._attempts.set(targetId, attempt);
+                this.totalAttempts++;
+                if (attempt > 1) {
+                    cleanerLog(`Retrying ${targetId}, attempt ${attempt}/${this.config.maxRetriesPerObject}`);
+                }
+                if (attempt > this.config.maxRetriesPerObject) {
+                    this._skipObject(targetId);
+                    this._scheduleScan(this.config.scanDelay);
+                    return false;
+                }
+                this.busy = true;
+                this.currentTarget = target;
+                this.interactionToken++;
+                const token = this.interactionToken;
+                cleanerLog(`Cleaning ${targetId}`);
+                installFinishInteractionWatch(target, this, token);
+                try {
+                    const action = new InteractAction(target, null);
+                    this._activeAction = action;
+                    avatar.addAction(action);
+                    this._watchInteraction(token, target, action, performance.now());
+                    return true;
+                } catch (error) {
+                    cleanerWarn(`Interaction failed: ${targetId}`, error);
+                    this._completeInteraction(token, "exception", false);
+                    return false;
+                }
+            },
+
+            _watchInteraction(token, target, action, startedAt) {
+                if (!this.running || token !== this.interactionToken || !this.busy) {
+                    return;
+                }
+                const targetId = stableObjectId(target);
+                const avatar = w.__AVA_CURRENT_AVATAR__ ?? null;
+                if (!hasWorldReference(target)) {
+                    this._completeInteraction(token, "detached");
+                    return;
+                }
+                if (avatar && !avatarHasAction(avatar, action) && performance.now() - startedAt > 1000) {
+                    this._completeInteraction(token, "avatar action finished");
+                    return;
+                }
+                if (performance.now() - startedAt > this.config.interactionTimeout) {
+                    cleanerWarn(`Interaction timeout: ${targetId}`);
+                    this._completeInteraction(token, "timeout", false);
+                    return;
+                }
+                this._setTimer(() => this._watchInteraction(token, target, action, startedAt), 500);
+            },
+
+            _completeInteraction(token, reason, success = true) {
+                if (token !== this.interactionToken) {
+                    return false;
+                }
+                const target = this.currentTarget;
+                const targetId = target ? stableObjectId(target) : null;
+                this.busy = false;
+                this.currentTarget = null;
+                this._activeAction = null;
+                if (target) {
+                    restoreFinishInteractionWatch(target);
+                }
+                if (success) {
+                    this.cleanedObjects++;
+                    cleanerLog(`Completed ${targetId ?? "object"}`);
+                } else if (targetId) {
+                    this._registerFailure(targetId, reason);
+                }
+                if (this.running && !this.paused) {
+                    this._scheduleScan(this.config.scanDelay);
+                }
+                return true;
+            },
+
+            _registerFailure(targetId, reason) {
+                const attempts = this._attempts.get(targetId) ?? 1;
+                cleanerWarn(`${targetId} failed: ${reason}`);
+                if (attempts >= this.config.maxRetriesPerObject) {
+                    this._skipObject(targetId);
+                }
+            },
+
+            _skipObject(targetId) {
+                if (this._skippedObjects.has(targetId)) {
+                    return;
+                }
+                this._skippedObjects.add(targetId);
+                this.failedObjects++;
+                cleanerWarn(`Object skipped after ${this.config.maxRetriesPerObject} failures`, targetId);
+            }
+        };
+
+        w.__AVA_MAP_CLEANER__ = cleaner;
+        return cleaner;
+    }
+
+    function installMapCleanerWhenReady() {
+        const timer = setInterval(() => {
+            if (installAvatarCapture()) {
+                clearInterval(timer);
+            }
+        }, 500);
     }
 
     /*
@@ -2633,6 +3380,10 @@
                 commands: "__AVA_SERVICE_START__, __AVA_SERVICE_STOP__, __AVA_SERVICE_LIST__, __AVA_SERVICE_SHOW__, __AVA_SERVICE_LAST__, __AVA_SERVICE_CLEAR__"
             },
             {
+                section: "Map cleaner",
+                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.uninstall()"
+            },
+            {
                 section: "Status",
                 commands: "__AVA_STATUS__, __AVA_HELP__"
             }
@@ -2716,6 +3467,29 @@
                 destinationMenuReady:
                     state.destinationMenuReady,
 
+                mapCleanerRunning:
+                    w.__AVA_MAP_CLEANER__?.running ??
+                    false,
+
+                mapCleanerPaused:
+                    w.__AVA_MAP_CLEANER__?.paused ??
+                    false,
+
+                mapCleanerBusy:
+                    w.__AVA_MAP_CLEANER__?.busy ??
+                    false,
+
+                mapCleanerCurrentMap:
+                    w.__AVA_MAP_CLEANER__?.currentMap ??
+                    null,
+
+                mapCleanerCleanedObjects:
+                    w.__AVA_MAP_CLEANER__?.cleanedObjects ??
+                    0,
+
+                currentAvatarCaptured:
+                    Boolean(w.__AVA_CURRENT_AVATAR__),
+
                 callerErrors:
                     state.callerErrors.length
             };
@@ -2726,6 +3500,8 @@
         };
 
     initializeDestinationSystem();
+    initializeMapCleaner();
+    installMapCleanerWhenReady();
 
     console.log(
         "%c[AVA-V12] Safe Inspector installé",
