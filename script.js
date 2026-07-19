@@ -1287,37 +1287,216 @@
         }
     }
 
-    function classOrTypeAllowed(object, config) {
+    function hasInteractionBehaviour(object) {
+        try {
+            return (
+                typeof object?.getInteractPoint === "function" &&
+                typeof object?.startInteraction === "function" &&
+                typeof object?.finishInteraction === "function"
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function hasPartialInteractionApi(object) {
+        try {
+            return (
+                typeof object?.getInteractPoint === "function" ||
+                typeof object?.startInteraction === "function" ||
+                typeof object?.finishInteraction === "function" ||
+                typeof object?.readyInteract === "function" ||
+                typeof object?.canAddToQueue === "function"
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function exactClassOrTypeMatch(object, config) {
         const className = objectClassName(object);
-        const typeId = objectTypeId(object);
+        const typeId = String(objectTypeId(object) ?? "");
         const classes = config.allowedClasses ?? [];
         const typeIds = config.allowedTypeIds ?? [];
-        if (typeId && typeIds.includes(String(typeId))) {
-            return true;
+
+        return (
+            classes.includes(className) ||
+            typeIds.includes(typeId)
+        );
+    }
+
+    function cleanerExcluded(object, config) {
+        const className = objectClassName(object);
+        const typeId = String(objectTypeId(object) ?? "");
+        let objectId = "";
+
+        try {
+            objectId = String(object?.objectId ?? "");
+        } catch {}
+
+        return (
+            (config.excludedClasses ?? []).includes(className) ||
+            (config.excludedTypeIds ?? []).includes(typeId) ||
+            (config.excludedObjectIds ?? []).includes(objectId)
+        );
+    }
+
+    function garbageKeywordMatch(object, config) {
+        const keywords =
+            config.garbageKeywords ??
+            [];
+
+        if (keywords.length === 0) {
+            return false;
         }
-        if (className && classes.includes(className)) {
-            return true;
+
+        const haystack = [
+            objectClassName(object),
+            objectTypeId(object),
+            (() => {
+                try {
+                    return object?.objectId;
+                } catch {
+                    return "";
+                }
+            })()
+        ]
+            .map(value => String(value ?? "").toLowerCase())
+            .join(" ");
+
+        return keywords.some(keyword =>
+            haystack.includes(String(keyword).toLowerCase())
+        );
+    }
+
+    function classOrTypeAllowed(object, config) {
+        const exactMatch =
+            exactClassOrTypeMatch(object, config);
+
+        const behaviourMatch =
+            hasInteractionBehaviour(object);
+
+        const mode =
+            config.detectionMode ??
+            "hybrid";
+
+        if (mode === "strict") {
+            return exactMatch;
         }
-        return classes.length === 0 && typeIds.length === 0;
+
+        if (mode === "behavior") {
+            return behaviourMatch;
+        }
+
+        return exactMatch || behaviourMatch;
+    }
+
+    function candidateRejectionReason(object, config) {
+        if (!object || typeof object !== "object") {
+            return "not an object";
+        }
+
+        if (!hasPartialInteractionApi(object)) {
+            return "no interaction API";
+        }
+
+        if (cleanerExcluded(object, config)) {
+            return "excluded by config";
+        }
+
+        if (!hasWorldReference(object)) {
+            return "detached from world";
+        }
+
+        if (!classOrTypeAllowed(object, config)) {
+            return "class/type/behaviour not allowed";
+        }
+
+        return null;
     }
 
     function isCleanableObject(object, config) {
         try {
-            const hasInteractionApi = typeof object?.getInteractPoint === "function" && typeof object?.startInteraction === "function";
-            const hasQueueApi = typeof object?.readyInteract === "function" && typeof object?.canAddToQueue === "function";
-            if (!hasInteractionApi && !hasQueueApi) {
-                return false;
-            }
-            if (!hasWorldReference(object)) {
-                return false;
-            }
-            if (!callBooleanMethod(object, "readyInteract") || !callBooleanMethod(object, "canAddToQueue")) {
-                return false;
-            }
-            return classOrTypeAllowed(object, config);
+            return candidateRejectionReason(object, config) === null;
         } catch {
             return false;
         }
+    }
+
+    function interactionAvailability(object) {
+        const readyInteractResult =
+            callBooleanMethod(object, "readyInteract");
+
+        const canAddToQueueResult =
+            callBooleanMethod(object, "canAddToQueue");
+
+        return {
+            readyInteractResult,
+            canAddToQueueResult,
+            available:
+                readyInteractResult &&
+                canAddToQueueResult
+        };
+    }
+
+    function cleanerCandidateRow(object, config) {
+        const availability =
+            interactionAvailability(object);
+
+        const rejectionReason =
+            candidateRejectionReason(object, config);
+
+        return {
+            objectId: (() => {
+                try {
+                    return object?.objectId ?? null;
+                } catch {
+                    return null;
+                }
+            })(),
+            className: objectClassName(object),
+            typeId: objectTypeId(object),
+            position: objectPositionKey(object),
+            hasGetInteractPoint:
+                typeof object?.getInteractPoint === "function",
+            hasStartInteraction:
+                typeof object?.startInteraction === "function",
+            hasFinishInteraction:
+                typeof object?.finishInteraction === "function",
+            hasReadyInteract:
+                typeof object?.readyInteract === "function",
+            hasCanAddToQueue:
+                typeof object?.canAddToQueue === "function",
+            readyInteractResult:
+                availability.readyInteractResult,
+            canAddToQueueResult:
+                availability.canAddToQueueResult,
+            garbageKeywordMatch:
+                garbageKeywordMatch(object, config),
+            accepted:
+                rejectionReason === null,
+            rejectionReason,
+            rawObject:
+                object
+        };
+    }
+
+    function cleanerCandidatePriority(object, config) {
+        let priority = 0;
+
+        if (exactClassOrTypeMatch(object, config)) {
+            priority += 20;
+        }
+
+        if (garbageKeywordMatch(object, config)) {
+            priority += 10;
+        }
+
+        if (hasInteractionBehaviour(object)) {
+            priority += 5;
+        }
+
+        return priority;
     }
 
     function collectWorldRoots() {
@@ -1397,7 +1576,85 @@
         for (const root of collectWorldRoots()) {
             objects.push(...collectObjectsFromRoot(root, config));
         }
-        return uniqueObjects(objects);
+        return uniqueObjects(objects).sort((left, right) =>
+            cleanerCandidatePriority(right, config) -
+            cleanerCandidatePriority(left, config)
+        );
+    }
+
+    function collectInteractionCandidatesFromRoot(root, config) {
+        const found = [];
+        const queue = [{ value: root, depth: 0 }];
+        const seen = new WeakSet();
+        let seenCount = 0;
+        const maxDepth = config.worldScanDepth ?? 5;
+        const maxObjects = config.maxWorldScanObjects ?? 6000;
+
+        while (queue.length > 0 && seenCount < maxObjects) {
+            const item = queue.shift();
+            const value = item.value;
+
+            if (!value || typeof value !== "object" || seen.has(value)) {
+                continue;
+            }
+
+            seen.add(value);
+            seenCount++;
+
+            if (hasPartialInteractionApi(value)) {
+                found.push(value);
+            }
+
+            if (item.depth >= maxDepth) {
+                continue;
+            }
+
+            if (Array.isArray(value)) {
+                for (const child of value.slice(0, 300)) {
+                    if (child && typeof child === "object") {
+                        queue.push({ value: child, depth: item.depth + 1 });
+                    }
+                }
+
+                continue;
+            }
+
+            let keys = [];
+
+            try {
+                keys = Object.getOwnPropertyNames(value).slice(0, 80);
+            } catch {
+                keys = [];
+            }
+
+            for (const key of keys) {
+                if (["parent", "stage", "graphics"].includes(key)) {
+                    continue;
+                }
+
+                try {
+                    const child = value[key];
+
+                    if (child && typeof child === "object") {
+                        queue.push({ value: child, depth: item.depth + 1 });
+                    }
+                } catch {}
+            }
+        }
+
+        return found;
+    }
+
+    function inspectCleanerCandidates(config) {
+        const objects = [];
+
+        for (const root of collectWorldRoots()) {
+            objects.push(...collectInteractionCandidatesFromRoot(root, config));
+        }
+
+        return uniqueObjects(objects).map(object =>
+            cleanerCandidateRow(object, config)
+        );
     }
 
     function avatarHasAction(avatar, action, depth = 0, seen = new WeakSet()) {
@@ -1476,9 +1733,16 @@
 
         const cleaner = {
             config: {
-                maps: ["garbage", "garden", "restaurant", "schoolAvataria", "sculpt"],
-                allowedClasses: ["GarbageObject", "GardenObject", "RestaurantObject"],
+                maps: ["garbage"],
+                detectionMode: "hybrid",
+                allowedClasses: ["GarbageObject"],
                 allowedTypeIds: ["gbTrashEnrg"],
+                garbageKeywords: ["garbage", "trash", "rubbish", "waste", "gbtrash"],
+                excludedClasses: [],
+                excludedTypeIds: [],
+                excludedObjectIds: [],
+                temporaryUnavailableDelay: 1500,
+                fullRescanInterval: 1000,
                 interactionTimeout: 40000,
                 scanDelay: 500,
                 emptyScansRequired: 3,
@@ -1507,6 +1771,7 @@
             _attempts: new Map(),
             _skippedObjects: new Set(),
             _completedObjects: new Set(),
+            _pendingObjects: new Map(),
             _wrappedTargets: [],
             _activeAction: null,
             _lastScanTargets: [],
@@ -1534,6 +1799,7 @@
                 this._attempts = new Map();
                 this._skippedObjects = new Set();
                 this._completedObjects = new Set();
+                this._pendingObjects = new Map();
                 this._lastScanTargets = [];
                 cleanerLog("Started");
                 this._moveToConfiguredMap();
@@ -1577,11 +1843,64 @@
                     cleanedObjects: this.cleanedObjects,
                     failedObjects: this.failedObjects,
                     remainingTargets: this.remainingTargets,
+                    pendingTargets: this._pendingObjects.size,
                     visitedMaps: this.visitedMaps.slice(),
                     interactionToken: this.interactionToken,
                     totalAttempts: this.totalAttempts,
                     durationMs: this.startedAt ? Math.round(performance.now() - this.startedAt) : 0
                 };
+            },
+
+            inspectCandidates() {
+                const rows = inspectCleanerCandidates(this.config);
+                const accepted = rows.filter(row => row.accepted).length;
+
+                console.log(
+                    `[AVA CLEANER] ${rows.length} garbage candidates discovered`
+                );
+                console.log(`[AVA CLEANER] ${accepted} accepted`);
+                console.log(
+                    `[AVA CLEANER] ${rows.length - accepted} permanently rejected`
+                );
+                console.table(rows.map(row => ({
+                    objectId: row.objectId,
+                    className: row.className,
+                    typeId: row.typeId,
+                    position: row.position,
+                    hasGetInteractPoint: row.hasGetInteractPoint,
+                    hasStartInteraction: row.hasStartInteraction,
+                    hasFinishInteraction: row.hasFinishInteraction,
+                    hasReadyInteract: row.hasReadyInteract,
+                    hasCanAddToQueue: row.hasCanAddToQueue,
+                    readyInteractResult: row.readyInteractResult,
+                    canAddToQueueResult: row.canAddToQueueResult,
+                    accepted: row.accepted,
+                    rejectionReason: row.rejectionReason
+                })));
+
+                return rows;
+            },
+
+            listDetectedTypes() {
+                const counts = new Map();
+                const rows = inspectCleanerCandidates(this.config)
+                    .filter(row => row.accepted);
+
+                for (const row of rows) {
+                    const key = `${row.className || "(unknown)"}::${String(row.typeId ?? "")}`;
+                    const existing = counts.get(key) ?? {
+                        className: row.className || "(unknown)",
+                        typeId: row.typeId,
+                        count: 0
+                    };
+
+                    existing.count++;
+                    counts.set(key, existing);
+                }
+
+                const table = Array.from(counts.values());
+                console.table(table);
+                return table;
             },
 
             uninstall() {
@@ -1643,6 +1962,7 @@
                 this._attempts = new Map();
                 this._skippedObjects = new Set();
                 this._completedObjects = new Set();
+                this._pendingObjects = new Map();
                 this._lastScanTargets = [];
                 this._restoreWrappedTargets();
                 cleanerLog(`Moving to ${mapId}`);
@@ -1698,6 +2018,7 @@
                     cleanerWarn("Interaction already running");
                     return;
                 }
+                const now = Date.now();
                 const targets = discoverCleanableObjects(this.config).filter(target => {
                     const targetId = stableObjectId(target);
                     return (
@@ -1705,6 +2026,30 @@
                         !this._skippedObjects.has(targetId)
                     );
                 });
+                const availableTargets = [];
+
+                for (const target of targets) {
+                    const targetId = stableObjectId(target);
+                    const pending = this._pendingObjects.get(targetId);
+
+                    if (pending && pending.retryAfter > now) {
+                        continue;
+                    }
+
+                    const availability = interactionAvailability(target);
+
+                    if (availability.available) {
+                        this._pendingObjects.delete(targetId);
+                        availableTargets.push(target);
+                    } else {
+                        this._pendingObjects.set(targetId, {
+                            target,
+                            reason: !availability.readyInteractResult ? "not ready" : "queue unavailable",
+                            retryAfter: now + this.config.temporaryUnavailableDelay
+                        });
+                    }
+                }
+
                 this._lastScanTargets = targets;
                 this.remainingTargets = targets.length;
                 cleanerLog(`${targets.length} target${targets.length === 1 ? "" : "s"} remaining`);
@@ -1712,8 +2057,13 @@
                     this._handleEmptyScan();
                     return;
                 }
+                if (availableTargets.length === 0) {
+                    this._emptyScans = 0;
+                    this._setTimer(() => this._scanAndRun(), this.config.fullRescanInterval);
+                    return;
+                }
                 this._emptyScans = 0;
-                this._startInteraction(targets[0]);
+                this._startInteraction(availableTargets[0]);
             },
 
             _handleEmptyScan() {
@@ -1748,6 +2098,16 @@
                 if (!isCleanableObject(target, this.config)) {
                     this._registerFailure(targetId, "invalid target");
                     this._scheduleScan(this.config.scanDelay);
+                    return false;
+                }
+                const availability = interactionAvailability(target);
+                if (!availability.available) {
+                    this._pendingObjects.set(targetId, {
+                        target,
+                        reason: !availability.readyInteractResult ? "not ready" : "queue unavailable",
+                        retryAfter: Date.now() + this.config.temporaryUnavailableDelay
+                    });
+                    this._scheduleScan(this.config.fullRescanInterval);
                     return false;
                 }
                 const attempt = (this._attempts.get(targetId) ?? 0) + 1;
@@ -1813,6 +2173,7 @@
                 if (success) {
                     if (targetId) {
                         this._completedObjects.add(targetId);
+                        this._pendingObjects.delete(targetId);
                     }
                     this.cleanedObjects++;
                     cleanerLog(`Completed ${targetId ?? "object"}`);
@@ -1838,6 +2199,7 @@
                     return;
                 }
                 this._skippedObjects.add(targetId);
+                this._pendingObjects.delete(targetId);
                 this.failedObjects++;
                 cleanerWarn(`Object skipped after ${this.config.maxRetriesPerObject} failures`, targetId);
             }
@@ -3412,7 +3774,7 @@
             },
             {
                 section: "Map cleaner",
-                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.uninstall()"
+                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.uninstall()"
             },
             {
                 section: "Status",
@@ -3520,6 +3882,10 @@
 
                 mapCleanerCompletedObjects:
                     w.__AVA_MAP_CLEANER__?._completedObjects?.size ??
+                    0,
+
+                mapCleanerPendingObjects:
+                    w.__AVA_MAP_CLEANER__?._pendingObjects?.size ??
                     0,
 
                 currentAvatarCaptured:
