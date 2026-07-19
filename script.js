@@ -1,12 +1,13 @@
 // ==UserScript==
-// @name         Avataria Safe Inspector V11
+// @name         Avataria Safe Inspector V12
 // @namespace    local-debug
-// @version      11.0
+// @version      12.0
 // @description  Inspection réseau, WalkAction et événements UI filtrés
 // @match        https://cdn-sp.tortugasocial.com/avataria-vk/app/index_js.html*
 // @run-at       document-start
 // @grant        unsafeWindow
 // @grant        GM_setClipboard
+// @grant        GM_registerMenuCommand
 // ==/UserScript==
 
 (function () {
@@ -25,6 +26,7 @@
     }
 
     w.__AVA_V11_INSTALLED__ = true;
+    w.__AVA_V12_INSTALLED__ = true;
 
     const state = {
         /*
@@ -80,6 +82,13 @@
         actionCaptureLabel: "",
         actionCaptureStartedAt: 0,
         actionCandidates: [],
+
+        /*
+         * Work destinations
+         */
+        destinationIds: [],
+        destinationCommandsReady: false,
+        destinationMenuReady: false,
 
         /*
          * Diagnostics
@@ -298,6 +307,283 @@
         }
 
         return result;
+    }
+
+    /*
+     * ============================================================
+     * WORK DESTINATIONS
+     * ============================================================
+     */
+
+    function getWorkManager() {
+        try {
+            return (
+                w.penzville
+                    ?.city
+                    ?.Context
+                    ?.workManager ??
+                null
+            );
+        } catch {
+            return null;
+        }
+    }
+
+    function getWorkLocationClass() {
+        try {
+            const WorkLocation =
+                w.penzville
+                    ?.city
+                    ?.work
+                    ?.WorkLocation;
+
+            if (typeof WorkLocation !== "function") {
+                return null;
+            }
+
+            return WorkLocation;
+        } catch {
+            return null;
+        }
+    }
+
+    function getDestinationRegistry() {
+        try {
+            return getWorkManager()?.FYl ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    function getWorkLocationModel(id) {
+        try {
+            const manager =
+                getWorkManager();
+
+            if (
+                !manager ||
+                typeof manager.getWorkLocationModel !==
+                    "function"
+            ) {
+                return null;
+            }
+
+            return (
+                manager.getWorkLocationModel(String(id)) ??
+                null
+            );
+        } catch {
+            return null;
+        }
+    }
+
+    function getDestinationIds() {
+        try {
+            const registry =
+                getDestinationRegistry();
+
+            if (!registry || typeof registry !== "object") {
+                return null;
+            }
+
+            return Object.keys(registry);
+        } catch {
+            return null;
+        }
+    }
+
+    function destinationFriendlyName(id) {
+        try {
+            return String(id)
+                .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+                .replace(/[^a-zA-Z0-9]+/g, "_")
+                .replace(/^_+|_+$/g, "")
+                .toUpperCase();
+        } catch {
+            return null;
+        }
+    }
+
+    function destinationTableRow(id) {
+        const model =
+            getWorkLocationModel(id);
+
+        return {
+            id,
+            loadingContent:
+                model?.loadingContent ??
+                null,
+            rooms:
+                model?.rooms ??
+                null,
+            jobs:
+                model?.jobs ??
+                null
+        };
+    }
+
+    function createDestinationCommand(id, commandName) {
+        try {
+            if (!commandName) {
+                return false;
+            }
+
+            w[commandName] = function () {
+                return w.__AVA_GO_WORK__(id);
+            };
+
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    function createDestinationCommands(ids) {
+        const friendlyAliases = {
+            YARD: "garbage",
+            GARDEN: "garden",
+            RESTAURANT: "restaurant",
+            SCULPT: "sculpt",
+            SCHOOL: "schoolAvataria",
+            NPC_HOUSE: "npcHouse",
+            FORTUNE: "fortune",
+            FORTUNE2: "fortune2",
+            FORTUNE3: "fortune3"
+        };
+
+        for (const id of ids) {
+            const friendlyName =
+                destinationFriendlyName(id);
+
+            createDestinationCommand(
+                id,
+                `__AVA_GO_${friendlyName}__`
+            );
+        }
+
+        for (const [alias, id] of Object.entries(friendlyAliases)) {
+            createDestinationCommand(
+                id,
+                `__AVA_GO_${alias}__`
+            );
+        }
+
+        state.destinationCommandsReady = true;
+    }
+
+    function registerDestinationMenu(ids) {
+        try {
+            if (typeof GM_registerMenuCommand !== "function") {
+                return false;
+            }
+
+            for (const id of ids) {
+                GM_registerMenuCommand(
+                    `AVA Go ${destinationFriendlyName(id)}`,
+                    () => w.__AVA_GO_WORK__(id)
+                );
+            }
+
+            state.destinationMenuReady = true;
+            return true;
+        } catch (error) {
+            console.warn(
+                "[AVA-V12] Enregistrement du menu impossible",
+                error
+            );
+
+            return false;
+        }
+    }
+
+    w.__AVA_GO_WORK__ = function (id) {
+        const manager =
+            getWorkManager();
+
+        if (!manager) {
+            console.error("[AVA-V12] WorkManager indisponible");
+            return false;
+        }
+
+        const WorkLocation =
+            getWorkLocationClass();
+
+        if (!WorkLocation) {
+            console.error("[AVA-V12] WorkLocation indisponible");
+            return false;
+        }
+
+        const stringId =
+            String(id);
+
+        const model =
+            getWorkLocationModel(stringId);
+
+        if (!model) {
+            console.error(
+                `[AVA-V12] Destination inconnue : ${stringId}`
+            );
+
+            return false;
+        }
+
+        try {
+            w.penzville.city.Context.currentLocation =
+                new WorkLocation(stringId);
+
+            return true;
+        } catch (error) {
+            console.error(
+                `[AVA-V12] Téléportation impossible : ${stringId}`,
+                error
+            );
+
+            return false;
+        }
+    };
+
+    w.__AVA_LIST_DESTINATIONS__ = function () {
+        const ids =
+            getDestinationIds() ??
+            [];
+
+        const rows =
+            ids.map(destinationTableRow);
+
+        console.table(rows);
+
+        return rows;
+    };
+
+    function initializeDestinationSystem() {
+        const timer =
+            setInterval(() => {
+                const manager =
+                    getWorkManager();
+
+                if (!manager) {
+                    return;
+                }
+
+                const ids =
+                    getDestinationIds();
+
+                if (!ids) {
+                    return;
+                }
+
+                clearInterval(timer);
+
+                state.destinationIds =
+                    ids.slice();
+
+                createDestinationCommands(ids);
+                registerDestinationMenu(ids);
+
+                console.log(
+                    "[AVA-V12] Destination system ready"
+                );
+            }, 500);
     }
 
     /*
@@ -1757,6 +2043,52 @@
 
     /*
      * ============================================================
+     * AIDE
+     * ============================================================
+     */
+
+    w.__AVA_HELP__ = function () {
+        const commands = [
+            {
+                section: "Network",
+                commands: "__AVA_NET_START__, __AVA_NET_STOP__, __AVA_NET_LIST__, __AVA_NET_SHOW__, __AVA_NET_COPY__"
+            },
+            {
+                section: "UI",
+                commands: "__AVA_INSTALL_UI_HOOK__, __AVA_UI_START__, __AVA_UI_STOP__, __AVA_UI_LIST__, __AVA_UI_SHOW__"
+            },
+            {
+                section: "Walk",
+                commands: "__AVA_WALK_TO__"
+            },
+            {
+                section: "Recording",
+                commands: "__AVA_RECORD_START__, __AVA_RECORD_STOP__, __AVA_RECORD_LIST__"
+            },
+            {
+                section: "Replay",
+                commands: "__AVA_REPLAY_SEQUENCE__"
+            },
+            {
+                section: "Destination commands",
+                commands: "__AVA_LIST_DESTINATIONS__, __AVA_GO_WORK__, __AVA_GO_<DESTINATION>__, __AVA_GO_YARD__, __AVA_GO_GARDEN__, __AVA_GO_RESTAURANT__, __AVA_GO_SCULPT__, __AVA_GO_SCHOOL__, __AVA_GO_NPC_HOUSE__, __AVA_GO_FORTUNE__, __AVA_GO_FORTUNE2__, __AVA_GO_FORTUNE3__"
+            },
+            {
+                section: "Action capture",
+                commands: "__AVA_ACTION_START__, __AVA_ACTION_STOP__, __AVA_ACTION_LIST__, __AVA_ACTION_SHOW__, __AVA_ACTION_TEST__"
+            },
+            {
+                section: "Status",
+                commands: "__AVA_STATUS__, __AVA_HELP__"
+            }
+        ];
+
+        console.table(commands);
+        return commands;
+    };
+
+    /*
+     * ============================================================
      * STATUS
      * ============================================================
      */
@@ -1803,6 +2135,15 @@
                 recordedMoves:
                     state.recordedMoves.length,
 
+                destinationIds:
+                    state.destinationIds.length,
+
+                destinationCommandsReady:
+                    state.destinationCommandsReady,
+
+                destinationMenuReady:
+                    state.destinationMenuReady,
+
                 callerErrors:
                     state.callerErrors.length
             };
@@ -1812,8 +2153,10 @@
             return status;
         };
 
+    initializeDestinationSystem();
+
     console.log(
-        "%c[AVA-V11] Safe Inspector installé",
+        "%c[AVA-V12] Safe Inspector installé",
         "color:#9c27b0;font-weight:bold"
     );
 })();
