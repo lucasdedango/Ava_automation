@@ -1786,6 +1786,96 @@
         };
     }
 
+    function getBugCompletionState(target) {
+        if (!target) {
+            return {
+                known: false,
+                completed: false,
+                reason: "missing target"
+            };
+        }
+
+        const typeId =
+            String(
+                objectTypeId(target) ??
+                ""
+            );
+
+        if (typeId !== "gdIns") {
+            return {
+                known: false,
+                completed: false,
+                reason: "not a gdIns target"
+            };
+        }
+
+        try {
+            if (target.serviced === true) {
+                return {
+                    known: true,
+                    completed: true,
+                    reason: "serviced=true"
+                };
+            }
+        } catch {}
+
+        try {
+            if (target.She === true || target.She === 1) {
+                return {
+                    known: true,
+                    completed: true,
+                    reason: "She indicates serviced"
+                };
+            }
+        } catch {}
+
+        try {
+            if (target.serviced === false) {
+                return {
+                    known: true,
+                    completed: false,
+                    reason: "serviced=false"
+                };
+            }
+        } catch {}
+
+        try {
+            if (target.She === false || target.She === 0) {
+                return {
+                    known: true,
+                    completed: false,
+                    reason: "She indicates active"
+                };
+            }
+        } catch {}
+
+        return {
+            known: false,
+            completed: false,
+            reason: "completion state unavailable"
+        };
+    }
+
+    function inspectInteractionMethods(target) {
+        for (const name of [
+            "startInteraction",
+            "finishInteraction",
+            "readyInteract",
+            "canAddToQueue"
+        ]) {
+            try {
+                const fn = target?.[name];
+
+                if (typeof fn === "function") {
+                    cleanerLog(
+                        `${name}:`,
+                        fn.toString()
+                    );
+                }
+            } catch {}
+        }
+    }
+
     function targetView(target) {
         try {
             return (
@@ -1804,6 +1894,21 @@
             return {
                 available: false,
                 reason: "missing target"
+            };
+        }
+
+        const bugState =
+            getBugCompletionState(target);
+
+        if (
+            bugState.known &&
+            bugState.completed
+        ) {
+            return {
+                available: false,
+                permanent: true,
+                reason:
+                    `already squashed: ${bugState.reason}`
             };
         }
 
@@ -2216,7 +2321,8 @@
                 mapStableMs: 2500,
                 maxRetriesPerObject: 3,
                 worldScanDepth: 5,
-                maxWorldScanObjects: 6000
+                maxWorldScanObjects: 6000,
+                debugInteractionMethods: false
             },
             running: false,
             paused: false,
@@ -2238,6 +2344,8 @@
             _completedObjects: new Set(),
             _inactiveObjects: new Set(),
             _pendingObjects: new Map(),
+            _loggedBugStates: new Set(),
+            _debuggedInteractionMethods: new Set(),
             _wrappedTargets: [],
             _activeAction: null,
             _lastScanTargets: [],
@@ -2267,6 +2375,8 @@
                 this._completedObjects = new Set();
                 this._inactiveObjects = new Set();
                 this._pendingObjects = new Map();
+                this._loggedBugStates = new Set();
+                this._debuggedInteractionMethods = new Set();
                 this._lastScanTargets = [];
                 cleanerLog("Started");
                 this._moveToConfiguredMap();
@@ -2345,7 +2455,8 @@
                     readyInteractResult: row.readyInteractResult,
                     canAddToQueueResult: row.canAddToQueueResult,
                     accepted: row.accepted,
-                    rejectionReason: row.rejectionReason
+                    rejectionReason: row.rejectionReason,
+                    rawObject: row.rawObject
                 })));
 
                 return rows;
@@ -2371,6 +2482,47 @@
                 const table = Array.from(counts.values());
                 console.table(table);
                 return table;
+            },
+
+            inspectInteractionMethods(targetOrId) {
+                let target =
+                    targetOrId;
+
+                if (typeof targetOrId === "string") {
+                    const rows =
+                        inspectCleanerCandidates(this.config);
+
+                    const match =
+                        rows.find(row =>
+                            stableObjectId(row.rawObject) === targetOrId ||
+                            String(row.objectId ?? "") === targetOrId
+                        );
+
+                    target =
+                        match?.rawObject ??
+                        null;
+                }
+
+                if (!target) {
+                    cleanerWarn("No target found for inspectInteractionMethods");
+                    return false;
+                }
+
+                inspectInteractionMethods(target);
+                return true;
+            },
+
+            getRawCandidate(targetId) {
+                const rows =
+                    inspectCleanerCandidates(this.config);
+
+                const match =
+                    rows.find(row =>
+                        stableObjectId(row.rawObject) === targetId ||
+                        String(row.objectId ?? "") === String(targetId)
+                    );
+
+                return match?.rawObject ?? null;
             },
 
             uninstall() {
@@ -2434,6 +2586,8 @@
                 this._completedObjects = new Set();
                 this._inactiveObjects = new Set();
                 this._pendingObjects = new Map();
+                this._loggedBugStates = new Set();
+                this._debuggedInteractionMethods = new Set();
                 this._lastScanTargets = [];
                 this._restoreWrappedTargets();
                 cleanerLog(`Moving to ${mapId}`);
@@ -2517,6 +2671,58 @@
                 );
             },
 
+            _inspectBugCompletionState(target) {
+                const bugState =
+                    getBugCompletionState(target);
+
+                if (String(objectTypeId(target) ?? "") !== "gdIns") {
+                    return bugState;
+                }
+
+                const targetId =
+                    stableObjectId(target);
+
+                if (!this._loggedBugStates.has(targetId)) {
+                    this._loggedBugStates.add(targetId);
+
+                    cleanerLog(
+                        `gdIns state ${targetId}:`,
+                        {
+                            serviced: (() => {
+                                try {
+                                    return target?.serviced;
+                                } catch {
+                                    return undefined;
+                                }
+                            })(),
+                            She: (() => {
+                                try {
+                                    return target?.She;
+                                } catch {
+                                    return undefined;
+                                }
+                            })(),
+                            completionKnown:
+                                bugState.known,
+                            completed:
+                                bugState.completed,
+                            reason:
+                                bugState.reason
+                        }
+                    );
+                }
+
+                if (
+                    this.config.debugInteractionMethods &&
+                    !this._debuggedInteractionMethods.has(targetId)
+                ) {
+                    this._debuggedInteractionMethods.add(targetId);
+                    inspectInteractionMethods(target);
+                }
+
+                return bugState;
+            },
+
             _scanAndRun() {
                 if (!this.running || this.paused) {
                     return;
@@ -2543,8 +2749,34 @@
                         continue;
                     }
 
+                    const existingPending =
+                        this._pendingObjects.get(targetId);
+
+                    if (
+                        existingPending &&
+                        existingPending.retryAfter > now
+                    ) {
+                        activeTargets.push(target);
+                        continue;
+                    }
+
                     if (isExcludedObject(target, this.config)) {
                         logExcludedObject(target, this.config);
+                        continue;
+                    }
+
+                    const bugState =
+                        this._inspectBugCompletionState(target);
+
+                    if (
+                        bugState.known &&
+                        bugState.completed
+                    ) {
+                        cleanerLog(`Skipping already-squashed target ${targetId}`);
+                        this._markInactiveTarget(
+                            targetId,
+                            `already squashed: ${bugState.reason}`
+                        );
                         continue;
                     }
 
@@ -2559,7 +2791,7 @@
                     }
 
                     const previous =
-                        this._pendingObjects.get(targetId);
+                        existingPending;
 
                     const pending = {
                         target,
@@ -2684,6 +2916,21 @@
                     this._scheduleScan(this.config.scanDelay);
                     return false;
                 }
+                const bugState =
+                    this._inspectBugCompletionState(target);
+
+                if (
+                    bugState.known &&
+                    bugState.completed
+                ) {
+                    cleanerLog(`Skipping already-squashed target ${targetId}`);
+                    this._markInactiveTarget(
+                        targetId,
+                        `already squashed: ${bugState.reason}`
+                    );
+                    this._scheduleScan(100);
+                    return false;
+                }
                 const targetAvailability = checkTargetAvailability(target);
                 if (!targetAvailability.available) {
                     this._markInactiveTarget(targetId, targetAvailability.reason);
@@ -2715,6 +2962,13 @@
                     return true;
                 } catch (error) {
                     cleanerWarn(`Interaction failed: ${targetId}`, error);
+
+                    if (String(objectTypeId(target) ?? "") === "gdIns") {
+                        this._markInactiveTarget(targetId, "stale gdIns target");
+                        this._completeInteraction(token, "stale gdIns target", null);
+                        return false;
+                    }
+
                     this._completeInteraction(token, "exception", false);
                     return false;
                 }
@@ -4619,7 +4873,7 @@
             },
             {
                 section: "Map cleaner",
-                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.uninstall()"
+                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.getRawCandidate(), __AVA_MAP_CLEANER__.inspectInteractionMethods(), __AVA_MAP_CLEANER__.uninstall()"
             },
             {
                 section: "Auto clean loop",
