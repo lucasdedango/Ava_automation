@@ -18,6 +18,39 @@
      * Function.caller et Function.arguments.
      */
 
+    /*
+     * ============================================================
+     * USER AUTOMATION TOGGLES
+     * ============================================================
+     *
+     * Edit these values in the userscript header area before loading
+     * the game. This is intentionally independent from browser storage
+     * so a refresh always follows the visible script configuration.
+     */
+    const AVA_AUTO_CLEAN_LOOP_ON = false;
+    const AVA_AUTO_CLEAN_LOOP_IDLE_MS = 70 * 60 * 1000;
+
+    const AVA_STARTUP_WATCHDOG_ON = true;
+    const AVA_STARTUP_WATCHDOG_OPTIONS = {
+        initialDelayMs: 15000,
+        timeoutMs: 45000,
+        pollMs: 2000,
+        reloadDelayMs: 3000,
+        maxReloads: 3,
+        storageKey: "__AVA_STARTUP_RELOAD_COUNT__"
+    };
+
+    const startupWatchdog = {
+        initialDelayMs: AVA_STARTUP_WATCHDOG_OPTIONS.initialDelayMs,
+        timeoutMs: AVA_STARTUP_WATCHDOG_OPTIONS.timeoutMs,
+        pollMs: AVA_STARTUP_WATCHDOG_OPTIONS.pollMs,
+        reloadDelayMs: AVA_STARTUP_WATCHDOG_OPTIONS.reloadDelayMs,
+        maxReloads: AVA_STARTUP_WATCHDOG_OPTIONS.maxReloads,
+        storageKey: AVA_STARTUP_WATCHDOG_OPTIONS.storageKey,
+        startedAt: performance.now(),
+        timer: null
+    };
+
     const w = unsafeWindow;
 
     if (w.__AVA_V11_INSTALLED__) {
@@ -1376,6 +1409,127 @@
         }
     }
 
+    function gameLooksPlayable() {
+        try {
+            const avatar =
+                w.__AVA_CURRENT_AVATAR__;
+
+            const location =
+                w.penzville
+                    ?.city
+                    ?.Context
+                    ?.currentLocation;
+
+            return Boolean(
+                avatar &&
+                typeof avatar.addAction === "function" &&
+                location
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function startGameStartupWatchdog() {
+        if (!AVA_STARTUP_WATCHDOG_ON) {
+            return false;
+        }
+
+        const watchdog =
+            startupWatchdog;
+
+        setTimeout(() => {
+            watchdog.startedAt =
+                performance.now();
+
+            function check() {
+                if (gameLooksPlayable()) {
+                    try {
+                        sessionStorage.removeItem(
+                            watchdog.storageKey
+                        );
+                    } catch {}
+
+                    console.log(
+                        "[AVA WATCHDOG] Game startup successful"
+                    );
+
+                    return;
+                }
+
+                const elapsed =
+                    performance.now() -
+                    watchdog.startedAt;
+
+                if (elapsed < watchdog.timeoutMs) {
+                    watchdog.timer =
+                        setTimeout(
+                            check,
+                            watchdog.pollMs
+                        );
+
+                    return;
+                }
+
+                let reloadCount = 0;
+                let storageAvailable = true;
+
+                try {
+                    reloadCount =
+                        Number(
+                            sessionStorage.getItem(
+                                watchdog.storageKey
+                            ) ?? 0
+                        );
+                } catch {
+                    reloadCount = 0;
+                    storageAvailable = false;
+                }
+
+                if (!storageAvailable) {
+                    console.error(
+                        "[AVA WATCHDOG] Cannot track reload attempts; not reloading"
+                    );
+
+                    return;
+                }
+
+                if (reloadCount >= watchdog.maxReloads) {
+                    console.error(
+                        "[AVA WATCHDOG] Game failed to launch after maximum reload attempts"
+                    );
+
+                    return;
+                }
+
+                try {
+                    sessionStorage.setItem(
+                        watchdog.storageKey,
+                        String(reloadCount + 1)
+                    );
+                } catch {
+                    console.error(
+                        "[AVA WATCHDOG] Cannot store reload attempt; not reloading"
+                    );
+
+                    return;
+                }
+
+                console.warn(
+                    `[AVA WATCHDOG] Startup timeout; reloading page (${reloadCount + 1}/${watchdog.maxReloads})`
+                );
+
+                setTimeout(() => {
+                    w.location.reload();
+                }, watchdog.reloadDelayMs);
+            }
+
+            check();
+        }, watchdog.initialDelayMs);
+
+        return true;
+    }
+
     function hasWorldReference(object) {
         try {
             if (!object || typeof object !== "object" || object.fe == null) {
@@ -2684,14 +2838,16 @@
             completedAt: 0,
             nextReloadAt: 0,
             maps: ["garbage", "garden"],
-            idleMs: 70 * 60 * 1000,
+            idleMs: AVA_AUTO_CLEAN_LOOP_IDLE_MS,
             startDelayMs: 3000,
             pollMs: 2000,
             _timers: [],
 
             on() {
                 this.enabled = true;
-                localStorage.setItem(storageKey, "1");
+                try {
+                    localStorage.setItem(storageKey, "1");
+                } catch {}
                 console.log("[AVA AUTO LOOP] ON");
                 this._startCycleWhenReady();
                 return this.status();
@@ -2702,7 +2858,9 @@
                 this.running = false;
                 this.phase = "off";
                 this.nextReloadAt = 0;
-                localStorage.setItem(storageKey, "0");
+                try {
+                    localStorage.setItem(storageKey, "0");
+                } catch {}
                 this._clearTimers();
 
                 try {
@@ -2773,6 +2931,15 @@
 
                     if (!w.__AVA_MAP_CLEANER__) {
                         this._startCycleWhenReady();
+                        return;
+                    }
+
+                    if (!gameLooksPlayable()) {
+                        this.phase = "waiting-for-game";
+                        this._setTimer(
+                            () => this._startCycleWhenReady(),
+                            this.pollMs
+                        );
                         return;
                     }
 
@@ -2876,12 +3043,19 @@
         };
 
         loop.enabled =
-            localStorage.getItem(storageKey) === "1";
+            Boolean(AVA_AUTO_CLEAN_LOOP_ON);
+
+        try {
+            localStorage.setItem(
+                storageKey,
+                loop.enabled ? "1" : "0"
+            );
+        } catch {}
 
         w.__AVA_AUTO_CLEAN_LOOP__ = loop;
 
         if (loop.enabled) {
-            console.log("[AVA AUTO LOOP] Restored ON state");
+            console.log("[AVA AUTO LOOP] Script toggle is ON");
             loop._startCycleWhenReady();
         }
 
@@ -4575,6 +4749,13 @@
                     w.__AVA_AUTO_CLEAN_LOOP__?.enabled ??
                     false,
 
+                autoCleanLoopScriptToggle:
+                    AVA_AUTO_CLEAN_LOOP_ON,
+
+                autoCleanLoopIdleMs:
+                    w.__AVA_AUTO_CLEAN_LOOP__?.idleMs ??
+                    AVA_AUTO_CLEAN_LOOP_IDLE_MS,
+
                 autoCleanLoopPhase:
                     w.__AVA_AUTO_CLEAN_LOOP__?.phase ??
                     null,
@@ -4585,6 +4766,12 @@
                         {}
                     ).nextReloadInMs ??
                     null,
+
+                startupWatchdogEnabled:
+                    AVA_STARTUP_WATCHDOG_ON,
+
+                startupWatchdogPlayable:
+                    gameLooksPlayable(),
 
                 currentAvatarCaptured:
                     Boolean(w.__AVA_CURRENT_AVATAR__),
@@ -4602,6 +4789,7 @@
     initializeMapCleaner();
     installMapCleanerWhenReady();
     initializeAutoCleanLoop();
+    startGameStartupWatchdog();
 
     console.log(
         "%c[AVA-V12] Safe Inspector installé",
