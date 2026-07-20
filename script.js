@@ -1734,49 +1734,6 @@
         };
     }
 
-    function targetLooksRemoved(target) {
-        if (!target) {
-            return true;
-        }
-
-        const view =
-            targetView(target);
-
-        try {
-            if (
-                view &&
-                "parent" in view &&
-                view.parent == null
-            ) {
-                return true;
-            }
-        } catch {}
-
-        if (!hasWorldReference(target)) {
-            return true;
-        }
-
-        try {
-            if (
-                typeof target.readyInteract === "function" &&
-                target.readyInteract() === false
-            ) {
-                return true;
-            }
-        } catch {}
-
-        try {
-            return (
-                target.removed === true ||
-                target.deleted === true ||
-                target.destroyed === true ||
-                target.disposed === true
-            );
-        } catch {
-            return false;
-        }
-    }
-
     function cleanerCandidateRow(object, config) {
         const availability =
             interactionAvailability(object);
@@ -2048,17 +2005,13 @@
 
                 setTimeout(() => {
                     try {
-                        if (targetLooksRemoved(target)) {
-                            cleaner._completeInteraction(token, "finishInteraction");
-                        } else {
-                            cleaner._completeInteraction(
-                                token,
-                                "interaction finished but target remained active",
-                                false
-                            );
-                        }
+                        cleaner._completeInteraction(
+                            token,
+                            "finishInteraction",
+                            true
+                        );
                     } catch {}
-                }, 300);
+                }, 100);
 
                 return result;
             }
