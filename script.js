@@ -1632,6 +1632,151 @@
         };
     }
 
+    function targetView(target) {
+        try {
+            return (
+                target?.view ??
+                target?._view ??
+                target?.fe ??
+                null
+            );
+        } catch {
+            return null;
+        }
+    }
+
+    function checkTargetAvailability(target) {
+        if (!target) {
+            return {
+                available: false,
+                reason: "missing target"
+            };
+        }
+
+        try {
+            if (
+                typeof target.readyInteract === "function" &&
+                target.readyInteract() !== true
+            ) {
+                return {
+                    available: false,
+                    reason: "readyInteract returned false"
+                };
+            }
+        } catch {
+            return {
+                available: false,
+                reason: "readyInteract threw an error"
+            };
+        }
+
+        try {
+            if (
+                typeof target.canAddToQueue === "function" &&
+                target.canAddToQueue() === false
+            ) {
+                return {
+                    available: false,
+                    reason: "canAddToQueue returned false"
+                };
+            }
+        } catch {
+            return {
+                available: false,
+                reason: "canAddToQueue threw an error"
+            };
+        }
+
+        const view =
+            targetView(target);
+
+        if (view) {
+            try {
+                if (view.visible === false) {
+                    return {
+                        available: false,
+                        reason: "target view is hidden"
+                    };
+                }
+            } catch {}
+
+            try {
+                if (
+                    "parent" in view &&
+                    view.parent == null
+                ) {
+                    return {
+                        available: false,
+                        reason: "target view is detached"
+                    };
+                }
+            } catch {}
+        }
+
+        try {
+            if (
+                target.disposed === true ||
+                target.destroyed === true ||
+                target.removed === true ||
+                target.deleted === true ||
+                target.active === false
+            ) {
+                return {
+                    available: false,
+                    reason: "target marked inactive"
+                };
+            }
+        } catch {}
+
+        return {
+            available: true,
+            reason: null
+        };
+    }
+
+    function targetLooksRemoved(target) {
+        if (!target) {
+            return true;
+        }
+
+        const view =
+            targetView(target);
+
+        try {
+            if (
+                view &&
+                "parent" in view &&
+                view.parent == null
+            ) {
+                return true;
+            }
+        } catch {}
+
+        if (!hasWorldReference(target)) {
+            return true;
+        }
+
+        try {
+            if (
+                typeof target.readyInteract === "function" &&
+                target.readyInteract() === false
+            ) {
+                return true;
+            }
+        } catch {}
+
+        try {
+            return (
+                target.removed === true ||
+                target.deleted === true ||
+                target.destroyed === true ||
+                target.disposed === true
+            );
+        } catch {
+            return false;
+        }
+    }
+
     function cleanerCandidateRow(object, config) {
         const availability =
             interactionAvailability(object);
@@ -1903,9 +2048,17 @@
 
                 setTimeout(() => {
                     try {
-                        cleaner._completeInteraction(token, "finishInteraction");
+                        if (targetLooksRemoved(target)) {
+                            cleaner._completeInteraction(token, "finishInteraction");
+                        } else {
+                            cleaner._completeInteraction(
+                                token,
+                                "interaction finished but target remained active",
+                                false
+                            );
+                        }
                     } catch {}
-                }, 100);
+                }, 300);
 
                 return result;
             }
@@ -1945,6 +2098,8 @@
                 excludedKeywords: ["sit"],
                 temporaryUnavailableDelay: 1500,
                 fullRescanInterval: 1000,
+                maxUnavailableScans: 5,
+                maxUnavailableDuration: 8000,
                 targetSelectionMode: "nearest",
                 interactionTimeout: 40000,
                 scanDelay: 500,
@@ -1974,6 +2129,7 @@
             _attempts: new Map(),
             _skippedObjects: new Set(),
             _completedObjects: new Set(),
+            _inactiveObjects: new Set(),
             _pendingObjects: new Map(),
             _wrappedTargets: [],
             _activeAction: null,
@@ -2002,6 +2158,7 @@
                 this._attempts = new Map();
                 this._skippedObjects = new Set();
                 this._completedObjects = new Set();
+                this._inactiveObjects = new Set();
                 this._pendingObjects = new Map();
                 this._lastScanTargets = [];
                 cleanerLog("Started");
@@ -2047,6 +2204,7 @@
                     failedObjects: this.failedObjects,
                     remainingTargets: this.remainingTargets,
                     pendingTargets: this._pendingObjects.size,
+                    inactiveTargets: this._inactiveObjects.size,
                     targetSelectionMode: this.config.targetSelectionMode,
                     avatarPoint: getAvatarPoint(),
                     visitedMaps: this.visitedMaps.slice(),
@@ -2167,6 +2325,7 @@
                 this._attempts = new Map();
                 this._skippedObjects = new Set();
                 this._completedObjects = new Set();
+                this._inactiveObjects = new Set();
                 this._pendingObjects = new Map();
                 this._lastScanTargets = [];
                 this._restoreWrappedTargets();
@@ -2260,51 +2419,102 @@
                     return;
                 }
                 const now = Date.now();
-                const targets = discoverCleanableObjects(this.config).filter(target => {
-                    const targetId = stableObjectId(target);
-                    if (isExcludedObject(target, this.config)) {
-                        logExcludedObject(target, this.config);
-                        return false;
-                    }
+                const discoveredTargets =
+                    discoverCleanableObjects(this.config);
 
-                    return (
-                        !this._completedObjects.has(targetId) &&
-                        !this._skippedObjects.has(targetId)
-                    );
-                });
+                const activeTargets = [];
                 const availableTargets = [];
 
-                for (const target of targets) {
+                for (const target of discoveredTargets) {
                     const targetId = stableObjectId(target);
-                    const pending = this._pendingObjects.get(targetId);
 
-                    if (pending && pending.retryAfter > now) {
+                    if (
+                        this._completedObjects.has(targetId) ||
+                        this._skippedObjects.has(targetId) ||
+                        this._inactiveObjects.has(targetId)
+                    ) {
                         continue;
                     }
 
-                    const availability = interactionAvailability(target);
+                    if (isExcludedObject(target, this.config)) {
+                        logExcludedObject(target, this.config);
+                        continue;
+                    }
+
+                    const availability =
+                        interactionAvailability(target);
 
                     if (availability.available) {
                         this._pendingObjects.delete(targetId);
+                        activeTargets.push(target);
                         availableTargets.push(target);
-                    } else {
-                        this._pendingObjects.set(targetId, {
-                            target,
-                            reason: !availability.readyInteractResult ? "not ready" : "queue unavailable",
-                            retryAfter: now + this.config.temporaryUnavailableDelay
-                        });
+                        continue;
                     }
+
+                    const previous =
+                        this._pendingObjects.get(targetId);
+
+                    const pending = {
+                        target,
+                        reason: !availability.readyInteractResult
+                            ? "not ready"
+                            : "queue unavailable",
+                        firstSeenAt:
+                            previous?.firstSeenAt ??
+                            now,
+                        lastSeenAt:
+                            now,
+                        unavailableCount:
+                            (previous?.unavailableCount ?? 0) + 1,
+                        retryAfter:
+                            now + this.config.temporaryUnavailableDelay
+                    };
+
+                    const permanentlyUnavailable =
+                        pending.unavailableCount >= this.config.maxUnavailableScans ||
+                        now - pending.firstSeenAt >= this.config.maxUnavailableDuration;
+
+                    if (permanentlyUnavailable) {
+                        this._markInactiveTarget(
+                            targetId,
+                            `${pending.reason} for ${pending.unavailableCount} scans`
+                        );
+                        continue;
+                    }
+
+                    this._pendingObjects.set(targetId, pending);
+                    activeTargets.push(target);
                 }
 
-                this._lastScanTargets = targets;
-                this.remainingTargets = targets.length;
-                cleanerLog(`${targets.length} target${targets.length === 1 ? "" : "s"} remaining`);
-                if (targets.length === 0) {
+                this._lastScanTargets = activeTargets;
+                this.remainingTargets = activeTargets.length;
+                cleanerLog(
+                    `${activeTargets.length} target${activeTargets.length === 1 ? "" : "s"} remaining: ` +
+                    `${availableTargets.length} available, ` +
+                    `${this._pendingObjects.size} pending`
+                );
+
+                if (activeTargets.length === 0) {
                     this._handleEmptyScan();
                     return;
                 }
+
                 if (availableTargets.length === 0) {
-                    this._emptyScans = 0;
+                    this._emptyScans++;
+
+                    if (this._emptyScans >= this.config.emptyScansRequired) {
+                        cleanerLog("No available targets remain; treating map as complete");
+
+                        for (const [targetId] of this._pendingObjects) {
+                            this._inactiveObjects.add(targetId);
+                            this._skippedObjects.add(targetId);
+                        }
+
+                        this._pendingObjects.clear();
+                        this._handleEmptyScan();
+                        return;
+                    }
+
                     this._setTimer(() => this._scanAndRun(), this.config.fullRescanInterval);
                     return;
                 }
@@ -2367,14 +2577,10 @@
                     this._scheduleScan(this.config.scanDelay);
                     return false;
                 }
-                const availability = interactionAvailability(target);
-                if (!availability.available) {
-                    this._pendingObjects.set(targetId, {
-                        target,
-                        reason: !availability.readyInteractResult ? "not ready" : "queue unavailable",
-                        retryAfter: Date.now() + this.config.temporaryUnavailableDelay
-                    });
-                    this._scheduleScan(this.config.fullRescanInterval);
+                const targetAvailability = checkTargetAvailability(target);
+                if (!targetAvailability.available) {
+                    this._markInactiveTarget(targetId, targetAvailability.reason);
+                    this._scheduleScan(100);
                     return false;
                 }
                 const attempt = (this._attempts.get(targetId) ?? 0) + 1;
@@ -2412,12 +2618,20 @@
                     return;
                 }
                 const targetId = stableObjectId(target);
-                const avatar = w.__AVA_CURRENT_AVATAR__ ?? null;
                 if (!hasWorldReference(target)) {
                     this._completeInteraction(token, "detached");
                     return;
                 }
                 if (performance.now() - startedAt > this.config.interactionTimeout) {
+                    const targetAvailability = checkTargetAvailability(target);
+
+                    if (!targetAvailability.available) {
+                        this._markInactiveTarget(targetId, targetAvailability.reason);
+                        cleanerLog(`Skipped inactive target after timeout: ${targetId}`);
+                        this._completeInteraction(token, "timeout inactive target", null);
+                        return;
+                    }
+
                     cleanerWarn(`Interaction timeout: ${targetId}`);
                     this._completeInteraction(token, "timeout", false);
                     return;
@@ -2437,20 +2651,36 @@
                 if (target) {
                     restoreFinishInteractionWatch(target);
                 }
-                if (success) {
+                if (success === true) {
                     if (targetId) {
                         this._completedObjects.add(targetId);
                         this._pendingObjects.delete(targetId);
                     }
                     this.cleanedObjects++;
                     cleanerLog(`Completed ${targetId ?? "object"}`);
-                } else if (targetId) {
+                } else if (success === false && targetId) {
                     this._registerFailure(targetId, reason);
                 }
                 if (this.running && !this.paused) {
                     this._scheduleScan(this.config.scanDelay);
                 }
                 return true;
+            },
+
+            _markInactiveTarget(targetId, reason) {
+                if (!targetId || this._inactiveObjects.has(targetId)) {
+                    return;
+                }
+
+                this._inactiveObjects.add(targetId);
+                this._pendingObjects.delete(targetId);
+                this._skippedObjects.add(targetId);
+
+                cleanerLog(`Ignored inactive target ${targetId}`);
+
+                if (reason) {
+                    cleanerLog(`Reason: ${reason}`);
+                }
             },
 
             _registerFailure(targetId, reason) {
@@ -4378,6 +4608,10 @@
 
                 mapCleanerPendingObjects:
                     w.__AVA_MAP_CLEANER__?._pendingObjects?.size ??
+                    0,
+
+                mapCleanerInactiveObjects:
+                    w.__AVA_MAP_CLEANER__?._inactiveObjects?.size ??
                     0,
 
                 mapCleanerTargetSelectionMode:

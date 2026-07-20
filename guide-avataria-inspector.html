@@ -258,6 +258,7 @@ __AVA_AUTO_CLEAN_LOOP__.off();</code></pre>
 window.__AVA_V11.replayTimers.length = 0;</code></pre>
       <h3>Le cleaner sélectionne un meuble</h3><p>Ajoutez un mot dans <code>excludedKeywords</code>, par exemple <code>chair</code>, <code>bench</code> ou <code>lamp</code>.</p>
       <h3>Le cleaner ne trouve pas tous les déchets</h3><p>Utilisez <code>inspectCandidates()</code> et <code>listDetectedTypes()</code> pour voir les variantes rejetées ou détectées.</p>
+      <h3>Le cleaner reste bloqué sur des objets fantômes</h3><p>Le script ignore maintenant les cibles durablement indisponibles après plusieurs scans ou plusieurs secondes. Vérifiez <code>__AVA_MAP_CLEANER__.status()</code> pour voir <code>pendingTargets</code> et <code>inactiveTargets</code>.</p>
     </section>
 
     <section id="bonnes-pratiques" class="searchable"><h2>Bonnes pratiques</h2>
