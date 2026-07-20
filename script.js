@@ -2486,6 +2486,227 @@
 
     /*
      * ============================================================
+     * AUTO CLEAN LOOP
+     * ============================================================
+     */
+
+    function initializeAutoCleanLoop() {
+        const storageKey = "__AVA_AUTO_CLEAN_LOOP_ENABLED__";
+
+        const loop = {
+            enabled: false,
+            running: false,
+            phase: "off",
+            startedAt: 0,
+            completedAt: 0,
+            nextReloadAt: 0,
+            maps: ["garbage", "garden"],
+            idleMs: 70 * 60 * 1000,
+            startDelayMs: 3000,
+            pollMs: 2000,
+            _timers: [],
+
+            on() {
+                this.enabled = true;
+                localStorage.setItem(storageKey, "1");
+                console.log("[AVA AUTO LOOP] ON");
+                this._startCycleWhenReady();
+                return this.status();
+            },
+
+            off() {
+                this.enabled = false;
+                this.running = false;
+                this.phase = "off";
+                this.nextReloadAt = 0;
+                localStorage.setItem(storageKey, "0");
+                this._clearTimers();
+
+                try {
+                    if (w.__AVA_MAP_CLEANER__?.running) {
+                        w.__AVA_MAP_CLEANER__.stop();
+                    }
+                } catch {}
+
+                console.log("[AVA AUTO LOOP] OFF");
+                return this.status();
+            },
+
+            toggle(value) {
+                if (typeof value === "boolean") {
+                    return value ? this.on() : this.off();
+                }
+
+                return this.enabled ? this.off() : this.on();
+            },
+
+            status() {
+                return {
+                    enabled: this.enabled,
+                    running: this.running,
+                    phase: this.phase,
+                    maps: this.maps.slice(),
+                    idleMs: this.idleMs,
+                    startedAt: this.startedAt,
+                    completedAt: this.completedAt,
+                    nextReloadAt: this.nextReloadAt,
+                    nextReloadInMs: this.nextReloadAt
+                        ? Math.max(0, this.nextReloadAt - Date.now())
+                        : null
+                };
+            },
+
+            _setTimer(callback, delay) {
+                const timer = setTimeout(() => {
+                    this._timers = this._timers.filter(item => item !== timer);
+                    callback();
+                }, delay);
+
+                this._timers.push(timer);
+                return timer;
+            },
+
+            _clearTimers() {
+                for (const timer of this._timers) {
+                    clearTimeout(timer);
+                }
+
+                this._timers.length = 0;
+            },
+
+            _startCycleWhenReady() {
+                this._clearTimers();
+
+                if (!this.enabled) {
+                    return;
+                }
+
+                this.phase = "waiting-for-game";
+
+                this._setTimer(() => {
+                    if (!this.enabled) {
+                        return;
+                    }
+
+                    if (!w.__AVA_MAP_CLEANER__) {
+                        this._startCycleWhenReady();
+                        return;
+                    }
+
+                    this._startCleaningCycle();
+                }, this.startDelayMs);
+            },
+
+            _startCleaningCycle() {
+                if (!this.enabled) {
+                    return;
+                }
+
+                if (w.__AVA_MAP_CLEANER__?.running) {
+                    this._setTimer(() => this._watchCleaner(), this.pollMs);
+                    return;
+                }
+
+                this.running = true;
+                this.phase = "cleaning";
+                this.startedAt = Date.now();
+                this.completedAt = 0;
+                this.nextReloadAt = 0;
+
+                console.log("[AVA AUTO LOOP] Cleaning yard then garden");
+
+                try {
+                    w.__AVA_MAP_CLEANER__.start({
+                        maps: this.maps.slice(),
+                        detectionMode: "hybrid",
+                        targetSelectionMode: "nearest",
+                        excludedKeywords: ["sit"]
+                    });
+                } catch (error) {
+                    console.error("[AVA AUTO LOOP] Cleaner start failed", error);
+                    this._scheduleIdleReload();
+                    return;
+                }
+
+                this._setTimer(() => this._watchCleaner(), this.pollMs);
+            },
+
+            _watchCleaner() {
+                if (!this.enabled) {
+                    return;
+                }
+
+                const cleaner =
+                    w.__AVA_MAP_CLEANER__;
+
+                if (!cleaner) {
+                    this._startCycleWhenReady();
+                    return;
+                }
+
+                if (cleaner.running || cleaner.busy) {
+                    this._setTimer(() => this._watchCleaner(), this.pollMs);
+                    return;
+                }
+
+                const visited =
+                    cleaner.visitedMaps ??
+                    [];
+
+                const finishedAllMaps =
+                    this.maps.every(map => visited.includes(map));
+
+                if (!finishedAllMaps) {
+                    this._setTimer(() => this._watchCleaner(), this.pollMs);
+                    return;
+                }
+
+                this._scheduleIdleReload();
+            },
+
+            _scheduleIdleReload() {
+                if (!this.enabled) {
+                    return;
+                }
+
+                this.running = false;
+                this.phase = "idle";
+                this.completedAt = Date.now();
+                this.nextReloadAt = this.completedAt + this.idleMs;
+
+                console.log(
+                    `[AVA AUTO LOOP] Idle for ${Math.round(this.idleMs / 60000)} minutes before reload`
+                );
+
+                this._setTimer(() => this._reload(), this.idleMs);
+            },
+
+            _reload() {
+                if (!this.enabled) {
+                    return;
+                }
+
+                this.phase = "reloading";
+                console.log("[AVA AUTO LOOP] Reloading page");
+                w.location.reload();
+            }
+        };
+
+        loop.enabled =
+            localStorage.getItem(storageKey) === "1";
+
+        w.__AVA_AUTO_CLEAN_LOOP__ = loop;
+
+        if (loop.enabled) {
+            console.log("[AVA AUTO LOOP] Restored ON state");
+            loop._startCycleWhenReady();
+        }
+
+        return loop;
+    }
+
+    /*
+     * ============================================================
      * FUNCTION.CALLER / ARGUMENTS
      * ============================================================
      */
@@ -4044,6 +4265,10 @@
                 commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.uninstall()"
             },
             {
+                section: "Auto clean loop",
+                commands: "__AVA_AUTO_CLEAN_LOOP__.on(), __AVA_AUTO_CLEAN_LOOP__.off(), __AVA_AUTO_CLEAN_LOOP__.toggle(), __AVA_AUTO_CLEAN_LOOP__.status()"
+            },
+            {
                 section: "Status",
                 commands: "__AVA_STATUS__, __AVA_HELP__"
             }
@@ -4159,6 +4384,21 @@
                     w.__AVA_MAP_CLEANER__?.config?.targetSelectionMode ??
                     null,
 
+                autoCleanLoopEnabled:
+                    w.__AVA_AUTO_CLEAN_LOOP__?.enabled ??
+                    false,
+
+                autoCleanLoopPhase:
+                    w.__AVA_AUTO_CLEAN_LOOP__?.phase ??
+                    null,
+
+                autoCleanLoopNextReloadInMs:
+                    (
+                        w.__AVA_AUTO_CLEAN_LOOP__?.status?.() ??
+                        {}
+                    ).nextReloadInMs ??
+                    null,
+
                 currentAvatarCaptured:
                     Boolean(w.__AVA_CURRENT_AVATAR__),
 
@@ -4174,6 +4414,7 @@
     initializeDestinationSystem();
     initializeMapCleaner();
     installMapCleanerWhenReady();
+    initializeAutoCleanLoop();
 
     console.log(
         "%c[AVA-V12] Safe Inspector installé",
