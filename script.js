@@ -1198,14 +1198,127 @@
     }
 
     function objectPositionKey(object) {
+        const point =
+            getObjectPoint(object);
+
+        if (!point) {
+            return null;
+        }
+
+        return `${String(point.x)},${String(point.y)}`;
+    }
+
+    function getObjectPoint(object) {
         try {
-            const position = object?.position ?? object?.pos ?? object?.fe ?? null;
-            const x = position?.x ?? object?.x;
-            const y = position?.y ?? object?.y;
-            return x === undefined && y === undefined ? null : `${String(x)},${String(y)}`;
+            const value =
+                object?.position ??
+                object?.pos ??
+                object?.fe ??
+                object;
+
+            const x = Number(
+                value?.x ??
+                object?.x
+            );
+
+            const y = Number(
+                value?.y ??
+                object?.y
+            );
+
+            if (
+                !Number.isFinite(x) ||
+                !Number.isFinite(y)
+            ) {
+                return null;
+            }
+
+            return { x, y };
         } catch {
             return null;
         }
+    }
+
+    function getAvatarPoint() {
+        const avatar =
+            w.__AVA_CURRENT_AVATAR__;
+
+        const directPoint =
+            getObjectPoint(avatar);
+
+        if (directPoint) {
+            return directPoint;
+        }
+
+        const fallbacks = [
+            "position",
+            "pos",
+            "fe",
+            "actor",
+            "Eo"
+        ];
+
+        for (const key of fallbacks) {
+            try {
+                const point =
+                    getObjectPoint(avatar?.[key]);
+
+                if (point) {
+                    return point;
+                }
+            } catch {}
+        }
+
+        return null;
+    }
+
+    function distanceSquared(a, b) {
+        if (!a || !b) {
+            return Infinity;
+        }
+
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+
+        return dx * dx + dy * dy;
+    }
+
+    function getTargetInteractionPoint(target, avatar) {
+        if (typeof target?.getInteractPoint === "function") {
+            const expectsArgument =
+                target.getInteractPoint.length > 0;
+
+            try {
+                const point = expectsArgument && avatar
+                    ? target.getInteractPoint(avatar)
+                    : target.getInteractPoint();
+
+                const normalized =
+                    getObjectPoint(point);
+
+                if (normalized) {
+                    return normalized;
+                }
+            } catch {}
+        }
+
+        return getObjectPoint(target);
+    }
+
+    function formatPoint(point) {
+        if (!point) {
+            return "unknown";
+        }
+
+        return `${point.x},${point.y}`;
+    }
+
+    function formatDistance(distance) {
+        if (!Number.isFinite(distance)) {
+            return "Infinity";
+        }
+
+        return String(Math.round(distance));
     }
 
     function stableObjectId(object) {
@@ -1743,6 +1856,7 @@
                 excludedObjectIds: [],
                 temporaryUnavailableDelay: 1500,
                 fullRescanInterval: 1000,
+                targetSelectionMode: "nearest",
                 interactionTimeout: 40000,
                 scanDelay: 500,
                 emptyScansRequired: 3,
@@ -1844,6 +1958,8 @@
                     failedObjects: this.failedObjects,
                     remainingTargets: this.remainingTargets,
                     pendingTargets: this._pendingObjects.size,
+                    targetSelectionMode: this.config.targetSelectionMode,
+                    avatarPoint: getAvatarPoint(),
                     visitedMaps: this.visitedMaps.slice(),
                     interactionToken: this.interactionToken,
                     totalAttempts: this.totalAttempts,
@@ -2010,6 +2126,42 @@
                 this._setTimer(() => this._scanAndRun(), delay);
             },
 
+            _rankAvailableTargets(targets) {
+                const avatar =
+                    w.__AVA_CURRENT_AVATAR__ ??
+                    null;
+
+                const avatarPoint =
+                    getAvatarPoint();
+
+                const rankedTargets = targets.map(target => {
+                    const point =
+                        getTargetInteractionPoint(
+                            target,
+                            avatar
+                        );
+
+                    return {
+                        target,
+                        point,
+                        distance:
+                            distanceSquared(
+                                avatarPoint,
+                                point
+                            )
+                    };
+                });
+
+                if (this.config.targetSelectionMode === "discovery-order") {
+                    return rankedTargets;
+                }
+
+                return rankedTargets.sort(
+                    (left, right) =>
+                        left.distance - right.distance
+                );
+            },
+
             _scanAndRun() {
                 if (!this.running || this.paused) {
                     return;
@@ -2062,8 +2214,24 @@
                     this._setTimer(() => this._scanAndRun(), this.config.fullRescanInterval);
                     return;
                 }
+
+                const rankedTargets =
+                    this._rankAvailableTargets(availableTargets);
+
+                const next =
+                    rankedTargets[0];
+
+                if (!next?.target) {
+                    this._setTimer(() => this._scanAndRun(), this.config.fullRescanInterval);
+                    return;
+                }
+
+                cleanerLog(
+                    `Next target: ${stableObjectId(next.target)} at ${formatPoint(next.point)}, distance²=${formatDistance(next.distance)}`
+                );
+
                 this._emptyScans = 0;
-                this._startInteraction(availableTargets[0]);
+                this._startInteraction(next.target);
             },
 
             _handleEmptyScan() {
@@ -3887,6 +4055,10 @@
                 mapCleanerPendingObjects:
                     w.__AVA_MAP_CLEANER__?._pendingObjects?.size ??
                     0,
+
+                mapCleanerTargetSelectionMode:
+                    w.__AVA_MAP_CLEANER__?.config?.targetSelectionMode ??
+                    null,
 
                 currentAvatarCaptured:
                     Boolean(w.__AVA_CURRENT_AVATAR__),
