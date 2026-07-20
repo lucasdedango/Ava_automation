@@ -116,6 +116,7 @@
     let seenServiceObjects = new WeakSet();
     const cleanerObjectIds = new WeakMap();
     let cleanerObjectIdCounter = 0;
+    const loggedExcludedCleanerObjects = new Set();
 
     /*
      * ============================================================
@@ -1438,20 +1439,96 @@
         );
     }
 
-    function cleanerExcluded(object, config) {
-        const className = objectClassName(object);
-        const typeId = String(objectTypeId(object) ?? "");
+    function cleanerMetadataText(object) {
         let objectId = "";
 
         try {
             objectId = String(object?.objectId ?? "");
         } catch {}
 
-        return (
-            (config.excludedClasses ?? []).includes(className) ||
-            (config.excludedTypeIds ?? []).includes(typeId) ||
-            (config.excludedObjectIds ?? []).includes(objectId)
-        );
+        return [
+            objectId,
+            objectClassName(object),
+            String(objectTypeId(object) ?? "")
+        ]
+            .map(value => String(value ?? "").toLowerCase())
+            .join(" ");
+    }
+
+    function excludedKeywordForObject(object, config = w.__AVA_MAP_CLEANER__?.config ?? {}) {
+        const keywords =
+            config.excludedKeywords ??
+            [];
+
+        if (keywords.length === 0) {
+            return null;
+        }
+
+        const haystack =
+            cleanerMetadataText(object);
+
+        for (const keyword of keywords) {
+            const normalized =
+                String(keyword).toLowerCase();
+
+            if (normalized && haystack.includes(normalized)) {
+                return keyword;
+            }
+        }
+
+        return null;
+    }
+
+    function isExcludedObject(object, config = w.__AVA_MAP_CLEANER__?.config ?? {}) {
+        try {
+            if (excludedKeywordForObject(object, config)) {
+                return true;
+            }
+
+            const className = objectClassName(object);
+            const typeId = String(objectTypeId(object) ?? "");
+            let objectId = "";
+
+            try {
+                objectId = String(object?.objectId ?? "");
+            } catch {}
+
+            return (
+                (config.excludedClasses ?? []).includes(className) ||
+                (config.excludedTypeIds ?? []).includes(typeId) ||
+                (config.excludedObjectIds ?? []).includes(objectId)
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function logExcludedObject(object, config = w.__AVA_MAP_CLEANER__?.config ?? {}) {
+        const keyword =
+            excludedKeywordForObject(object, config);
+
+        if (!keyword) {
+            return;
+        }
+
+        const targetId =
+            stableObjectId(object);
+
+        const key =
+            `${targetId}::${String(keyword).toLowerCase()}`;
+
+        if (loggedExcludedCleanerObjects.has(key)) {
+            return;
+        }
+
+        loggedExcludedCleanerObjects.add(key);
+
+        cleanerLog(`Ignored ${targetId}`);
+        cleanerLog(`Reason: excluded keyword "${keyword}"`);
+    }
+
+    function cleanerExcluded(object, config = w.__AVA_MAP_CLEANER__?.config ?? {}) {
+        return isExcludedObject(object, config);
     }
 
     function garbageKeywordMatch(object, config) {
@@ -1514,7 +1591,10 @@
         }
 
         if (cleanerExcluded(object, config)) {
-            return "excluded by config";
+            const keyword = excludedKeywordForObject(object, config);
+            return keyword
+                ? `excluded keyword "${keyword}"`
+                : "excluded by config";
         }
 
         if (!hasWorldReference(object)) {
@@ -1595,6 +1675,10 @@
     }
 
     function cleanerCandidatePriority(object, config) {
+        if (isExcludedObject(object, config)) {
+            return -Infinity;
+        }
+
         let priority = 0;
 
         if (exactClassOrTypeMatch(object, config)) {
@@ -1637,6 +1721,10 @@
             }
             seen.add(value);
             seenCount++;
+            if (hasPartialInteractionApi(value) && isExcludedObject(value, config)) {
+                logExcludedObject(value, config);
+                continue;
+            }
             if (isCleanableObject(value, config)) {
                 found.push(value);
             }
@@ -1854,6 +1942,7 @@
                 excludedClasses: [],
                 excludedTypeIds: [],
                 excludedObjectIds: [],
+                excludedKeywords: ["sit"],
                 temporaryUnavailableDelay: 1500,
                 fullRescanInterval: 1000,
                 targetSelectionMode: "nearest",
@@ -2173,6 +2262,11 @@
                 const now = Date.now();
                 const targets = discoverCleanableObjects(this.config).filter(target => {
                     const targetId = stableObjectId(target);
+                    if (isExcludedObject(target, this.config)) {
+                        logExcludedObject(target, this.config);
+                        return false;
+                    }
+
                     return (
                         !this._completedObjects.has(targetId) &&
                         !this._skippedObjects.has(targetId)
@@ -2260,6 +2354,11 @@
                 const targetId = stableObjectId(target);
                 if (!avatar || typeof avatar.addAction !== "function" || !InteractAction) {
                     this._registerFailure(targetId, "missing avatar or InteractAction");
+                    this._scheduleScan(this.config.scanDelay);
+                    return false;
+                }
+                if (isExcludedObject(target, this.config)) {
+                    logExcludedObject(target, this.config);
                     this._scheduleScan(this.config.scanDelay);
                     return false;
                 }
