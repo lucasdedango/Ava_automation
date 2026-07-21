@@ -1368,23 +1368,33 @@
         return dx * dx + dy * dy;
     }
 
-    function getTargetInteractionPoint(target, avatar) {
+    function getRawTargetInteractionPoint(target, avatar) {
         if (typeof target?.getInteractPoint === "function") {
             const expectsArgument =
                 target.getInteractPoint.length > 0;
 
             try {
-                const point = expectsArgument && avatar
+                return expectsArgument && avatar
                     ? target.getInteractPoint(avatar)
                     : target.getInteractPoint();
-
-                const normalized =
-                    getObjectPoint(point);
-
-                if (normalized) {
-                    return normalized;
-                }
             } catch {}
+        }
+
+        return null;
+    }
+
+    function getTargetInteractionPoint(target, avatar) {
+        const rawPoint =
+            getRawTargetInteractionPoint(
+                target,
+                avatar
+            );
+
+        const normalized =
+            getObjectPoint(rawPoint);
+
+        if (normalized) {
+            return normalized;
         }
 
         return getObjectPoint(target);
@@ -3332,7 +3342,21 @@
                         ) {
                             interactionStarted = true;
                             cleanerLog(`Butterfly ready; starting native interaction ${targetId}`);
-                            target.startInteraction();
+
+                            const interactionPoint =
+                                getRawTargetInteractionPoint(
+                                    target,
+                                    avatar
+                                );
+
+                            if (interactionPoint) {
+                                target.startInteraction(
+                                    interactionPoint
+                                );
+                            } else {
+                                target.startInteraction();
+                            }
+
                             this._watchInteraction(token, target, null, startedAt);
                             return;
                         }
