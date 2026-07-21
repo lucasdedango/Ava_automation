@@ -1168,6 +1168,46 @@
         }
     }
 
+    function createWalkActionToPoint(avatar, point) {
+        if (
+            !avatar ||
+            typeof avatar.addAction !== "function" ||
+            typeof state.walkConstructor !== "function"
+        ) {
+            return null;
+        }
+
+        try {
+            const destination =
+                clonePoint(
+                    state.pointTemplate,
+                    point.x,
+                    point.y
+                );
+
+            const action =
+                new state.walkConstructor(
+                    avatar,
+                    state.walkOptions.B3e ??
+                        true,
+                    null,
+                    null
+                );
+
+            try {
+                action.dest =
+                    destination;
+            } catch {
+                action.y3e =
+                    destination;
+            }
+
+            return action;
+        } catch {
+            return null;
+        }
+    }
+
     function rememberCurrentAvatar(avatar) {
         try {
             if (!avatar || typeof avatar.addAction !== "function") {
@@ -1228,6 +1268,17 @@
             return object?.shopItem?.typeId ?? object?.typeId ?? object?.id ?? null;
         } catch {
             return null;
+        }
+    }
+
+    function isButterflyTarget(object) {
+        try {
+            return (
+                String(objectTypeId(object) ?? "") === "gdBtf" ||
+                objectClassName(object) === "WorkFlyObject"
+            );
+        } catch {
+            return false;
         }
     }
 
@@ -1993,6 +2044,61 @@
         };
     }
 
+    function checkButterflyTargetAvailability(target) {
+        if (!target) {
+            return {
+                available: false,
+                reason: "missing target"
+            };
+        }
+
+        const view =
+            targetView(target);
+
+        if (view) {
+            try {
+                if (view.visible === false) {
+                    return {
+                        available: false,
+                        reason: "target view is hidden"
+                    };
+                }
+            } catch {}
+
+            try {
+                if (
+                    "parent" in view &&
+                    view.parent == null
+                ) {
+                    return {
+                        available: false,
+                        reason: "target view is detached"
+                    };
+                }
+            } catch {}
+        }
+
+        try {
+            if (
+                target.disposed === true ||
+                target.destroyed === true ||
+                target.removed === true ||
+                target.deleted === true ||
+                target.active === false
+            ) {
+                return {
+                    available: false,
+                    reason: "target marked inactive"
+                };
+            }
+        } catch {}
+
+        return {
+            available: true,
+            reason: null
+        };
+    }
+
     function cleanerCandidateRow(object, config) {
         const availability =
             interactionAvailability(object);
@@ -2322,7 +2428,9 @@
                 maxRetriesPerObject: 3,
                 worldScanDepth: 5,
                 maxWorldScanObjects: 6000,
-                debugInteractionMethods: false
+                debugInteractionMethods: false,
+                butterflyReadyPollMs: 150,
+                butterflyMoveRefreshMs: 800
             },
             running: false,
             paused: false,
@@ -2348,6 +2456,7 @@
             _debuggedInteractionMethods: new Set(),
             _wrappedTargets: [],
             _activeAction: null,
+            _activeManualPromise: null,
             _lastScanTargets: [],
 
             start(options = {}) {
@@ -2377,6 +2486,7 @@
                 this._pendingObjects = new Map();
                 this._loggedBugStates = new Set();
                 this._debuggedInteractionMethods = new Set();
+                this._activeManualPromise = null;
                 this._lastScanTargets = [];
                 cleanerLog("Started");
                 this._moveToConfiguredMap();
@@ -2388,6 +2498,7 @@
                 this.paused = false;
                 this._clearTimers();
                 this._restoreWrappedTargets();
+                this._rejectManualInteraction("cleaner stopped");
                 this.remainingTargets = 0;
                 cleanerLog("Stopped", this._summary());
                 return this.status();
@@ -2484,6 +2595,42 @@
                 return table;
             },
 
+            catchNearestButterfly() {
+                if (this.busy) {
+                    return Promise.reject(
+                        new Error("Interaction already running")
+                    );
+                }
+
+                const target =
+                    this._findNearestButterfly();
+
+                if (!target) {
+                    return Promise.reject(
+                        new Error("No valid butterfly found")
+                    );
+                }
+
+                return new Promise((resolve, reject) => {
+                    const started =
+                        this._startButterflyInteraction(
+                            target,
+                            {
+                                manual: true,
+                                resolve,
+                                reject
+                            }
+                        );
+
+                    if (!started) {
+                        this._activeManualPromise = null;
+                        reject(
+                            new Error("Unable to start butterfly capture")
+                        );
+                    }
+                });
+            },
+
             inspectInteractionMethods(targetOrId) {
                 let target =
                     targetOrId;
@@ -2542,6 +2689,23 @@
                 };
             },
 
+            _rejectManualInteraction(reason) {
+                const manual =
+                    this._activeManualPromise;
+
+                if (!manual) {
+                    return;
+                }
+
+                this._activeManualPromise = null;
+
+                try {
+                    manual.reject(
+                        new Error(reason)
+                    );
+                } catch {}
+            },
+
             _setTimer(callback, delay) {
                 const timer = setTimeout(() => {
                     this._timers = this._timers.filter(item => item !== timer);
@@ -2588,6 +2752,7 @@
                 this._pendingObjects = new Map();
                 this._loggedBugStates = new Set();
                 this._debuggedInteractionMethods = new Set();
+                this._activeManualPromise = null;
                 this._lastScanTargets = [];
                 this._restoreWrappedTargets();
                 cleanerLog(`Moving to ${mapId}`);
@@ -2669,6 +2834,27 @@
                     (left, right) =>
                         left.distance - right.distance
                 );
+            },
+
+            _findNearestButterfly() {
+                const targets =
+                    discoverCleanableObjects(this.config)
+                        .filter(target => {
+                            const targetId =
+                                stableObjectId(target);
+
+                            return (
+                                isButterflyTarget(target) &&
+                                !this._completedObjects.has(targetId) &&
+                                !this._skippedObjects.has(targetId) &&
+                                !this._inactiveObjects.has(targetId) &&
+                                !isExcludedObject(target, this.config) &&
+                                isCleanableObject(target, this.config) &&
+                                checkButterflyTargetAvailability(target).available
+                            );
+                        });
+
+                return this._rankAvailableTargets(targets)[0]?.target ?? null;
             },
 
             _inspectBugCompletionState(target) {
@@ -2777,6 +2963,24 @@
                             targetId,
                             `already squashed: ${bugState.reason}`
                         );
+                        continue;
+                    }
+
+                    if (isButterflyTarget(target)) {
+                        const butterflyAvailability =
+                            checkButterflyTargetAvailability(target);
+
+                        if (!butterflyAvailability.available) {
+                            this._markInactiveTarget(
+                                targetId,
+                                butterflyAvailability.reason
+                            );
+                            continue;
+                        }
+
+                        this._pendingObjects.delete(targetId);
+                        activeTargets.push(target);
+                        availableTargets.push(target);
                         continue;
                     }
 
@@ -2901,8 +3105,20 @@
                 const avatar = w.__AVA_CURRENT_AVATAR__ ?? null;
                 const InteractAction = getInteractActionClass();
                 const targetId = stableObjectId(target);
-                if (!avatar || typeof avatar.addAction !== "function" || !InteractAction) {
-                    this._registerFailure(targetId, "missing avatar or InteractAction");
+                const butterflyTarget =
+                    isButterflyTarget(target);
+
+                if (
+                    !avatar ||
+                    typeof avatar.addAction !== "function" ||
+                    (!butterflyTarget && !InteractAction)
+                ) {
+                    this._registerFailure(
+                        targetId,
+                        butterflyTarget
+                            ? "missing avatar"
+                            : "missing avatar or InteractAction"
+                    );
                     this._scheduleScan(this.config.scanDelay);
                     return false;
                 }
@@ -2931,7 +3147,10 @@
                     this._scheduleScan(100);
                     return false;
                 }
-                const targetAvailability = checkTargetAvailability(target);
+                const targetAvailability = butterflyTarget
+                    ? checkButterflyTargetAvailability(target)
+                    : checkTargetAvailability(target);
+
                 if (!targetAvailability.available) {
                     this._markInactiveTarget(targetId, targetAvailability.reason);
                     this._scheduleScan(100);
@@ -2948,6 +3167,18 @@
                     this._scheduleScan(this.config.scanDelay);
                     return false;
                 }
+
+                if (butterflyTarget) {
+                    const started =
+                        this._startButterflyInteraction(target);
+
+                    if (!started) {
+                        this._scheduleScan(this.config.scanDelay);
+                    }
+
+                    return started;
+                }
+
                 this.busy = true;
                 this.currentTarget = target;
                 this.interactionToken++;
@@ -2974,8 +3205,157 @@
                 }
             },
 
+            _startButterflyInteraction(target, manual = null) {
+                if (this.busy) {
+                    cleanerWarn("Interaction already running");
+                    return false;
+                }
+
+                const avatar =
+                    w.__AVA_CURRENT_AVATAR__ ??
+                    null;
+
+                const targetId =
+                    stableObjectId(target);
+
+                const availability =
+                    checkButterflyTargetAvailability(target);
+
+                if (
+                    !avatar ||
+                    typeof avatar.addAction !== "function"
+                ) {
+                    this._registerFailure(targetId, "missing avatar");
+                    return false;
+                }
+
+                if (!availability.available) {
+                    this._markInactiveTarget(targetId, availability.reason);
+                    return false;
+                }
+
+                if (typeof target?.startInteraction !== "function") {
+                    this._registerFailure(targetId, "missing butterfly startInteraction");
+                    return false;
+                }
+
+                this.busy = true;
+                this.currentTarget = target;
+                this.interactionToken++;
+
+                const token =
+                    this.interactionToken;
+
+                if (manual) {
+                    this._activeManualPromise = {
+                        token,
+                        resolve: manual.resolve,
+                        reject: manual.reject
+                    };
+                }
+
+                cleanerLog(`Catching butterfly ${targetId}`);
+                installFinishInteractionWatch(target, this, token);
+
+                let lastMoveAt = 0;
+                let interactionStarted = false;
+                const startedAt =
+                    performance.now();
+
+                const requestWalk = () => {
+                    const now =
+                        performance.now();
+
+                    if (
+                        now - lastMoveAt <
+                        this.config.butterflyMoveRefreshMs
+                    ) {
+                        return;
+                    }
+
+                    const point =
+                        getTargetInteractionPoint(
+                            target,
+                            avatar
+                        );
+
+                    if (!point) {
+                        return;
+                    }
+
+                    const action =
+                        createWalkActionToPoint(
+                            avatar,
+                            point
+                        );
+
+                    if (!action) {
+                        return;
+                    }
+
+                    lastMoveAt = now;
+                    this._activeAction = action;
+                    avatar.addAction(action);
+                };
+
+                const tick = () => {
+                    if (
+                        token !== this.interactionToken ||
+                        !this.busy
+                    ) {
+                        return;
+                    }
+
+                    if (!hasWorldReference(target)) {
+                        this._completeInteraction(token, "detached");
+                        return;
+                    }
+
+                    if (
+                        performance.now() - startedAt >
+                        this.config.interactionTimeout
+                    ) {
+                        const timeoutReason = interactionStarted
+                            ? "butterfly finish timeout"
+                            : "butterfly ready timeout";
+
+                        cleanerWarn(`${timeoutReason}: ${targetId}`);
+                        this._completeInteraction(token, timeoutReason, false);
+                        return;
+                    }
+
+                    try {
+                        if (
+                            !interactionStarted &&
+                            typeof target.readyInteract === "function" &&
+                            target.readyInteract() === true
+                        ) {
+                            interactionStarted = true;
+                            cleanerLog(`Butterfly ready; starting native interaction ${targetId}`);
+                            target.startInteraction();
+                            this._watchInteraction(token, target, null, startedAt);
+                            return;
+                        }
+                    } catch (error) {
+                        cleanerWarn(`Butterfly startInteraction failed: ${targetId}`, error);
+                        this._completeInteraction(token, "butterfly startInteraction exception", false);
+                        return;
+                    }
+
+                    requestWalk();
+                    this._setTimer(tick, this.config.butterflyReadyPollMs);
+                };
+
+                requestWalk();
+                this._setTimer(tick, this.config.butterflyReadyPollMs);
+                return true;
+            },
+
             _watchInteraction(token, target, action, startedAt) {
-                if (!this.running || token !== this.interactionToken || !this.busy) {
+                const manual =
+                    this._activeManualPromise?.token === token;
+
+                if ((!this.running && !manual) || token !== this.interactionToken || !this.busy) {
                     return;
                 }
                 const targetId = stableObjectId(target);
@@ -3022,6 +3402,29 @@
                 } else if (success === false && targetId) {
                     this._registerFailure(targetId, reason);
                 }
+
+                const manual =
+                    this._activeManualPromise;
+
+                if (manual?.token === token) {
+                    this._activeManualPromise = null;
+
+                    try {
+                        if (success === false) {
+                            manual.reject(
+                                new Error(reason)
+                            );
+                        } else {
+                            manual.resolve({
+                                targetId,
+                                reason,
+                                completed:
+                                    success === true
+                            });
+                        }
+                    } catch {}
+                }
+
                 if (this.running && !this.paused) {
                     this._scheduleScan(this.config.scanDelay);
                 }
@@ -4873,7 +5276,7 @@
             },
             {
                 section: "Map cleaner",
-                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.getRawCandidate(), __AVA_MAP_CLEANER__.inspectInteractionMethods(), __AVA_MAP_CLEANER__.uninstall()"
+                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.catchNearestButterfly(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.getRawCandidate(), __AVA_MAP_CLEANER__.inspectInteractionMethods(), __AVA_MAP_CLEANER__.uninstall()"
             },
             {
                 section: "Auto clean loop",
