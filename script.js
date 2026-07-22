@@ -2971,6 +2971,13 @@
                 return getEnergy();
             },
 
+            _isEnergyPaused() {
+                return (
+                    this.paused === true &&
+                    this.pauseReason === "energy"
+                );
+            },
+
             inspectCandidates() {
                 const rows = inspectCleanerCandidates(this.config);
                 const accepted = rows.filter(row => row.accepted).length;
@@ -3057,6 +3064,14 @@
 
                     if (!started) {
                         this._activeManualPromise = null;
+
+                        if (this._isEnergyPaused()) {
+                            reject(
+                                new Error("Butterfly capture paused: not enough energy")
+                            );
+                            return;
+                        }
+
                         reject(
                             new Error("Unable to start butterfly capture")
                         );
@@ -3404,6 +3419,12 @@
                     new Set();
 
                 const captureNext = () => {
+                    if (this._isEnergyPaused()) {
+                        return Promise.reject(
+                            new Error("Butterfly capture paused: not enough energy")
+                        );
+                    }
+
                     const remainingIds =
                         targetIds.filter(targetId =>
                             !this._completedObjects.has(targetId)
@@ -3463,6 +3484,12 @@
 
                     return this._captureButterflyTarget(target)
                         .then(result => {
+                            if (this._isEnergyPaused()) {
+                                return Promise.reject(
+                                    new Error("Butterfly capture paused: not enough energy")
+                                );
+                            }
+
                             if (result?.completed === true) {
                                 failedRound.delete(targetId);
                             } else {
@@ -3482,6 +3509,12 @@
                             });
                         })
                         .catch(error => {
+                            if (this._isEnergyPaused()) {
+                                return Promise.reject(
+                                    new Error("Butterfly capture paused: not enough energy")
+                                );
+                            }
+
                             cleanerWarn(`Butterfly attempt failed: ${targetId}`, error);
                             failedRound.add(targetId);
                             this._deferButterflyTarget(
