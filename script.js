@@ -1418,17 +1418,23 @@
 
     function stableObjectId(object) {
         const parts = [];
+        let hasObjectId = false;
         try {
             if (object?.objectId !== undefined) {
                 parts.push(String(object.objectId));
+                hasObjectId = true;
             }
         } catch {}
         const typeId = objectTypeId(object);
-        const position = objectPositionKey(object);
-        const className = objectClassName(object);
         if (typeId !== null && typeId !== undefined) {
             parts.push(String(typeId));
         }
+        if (hasObjectId) {
+            return parts.join("|");
+        }
+
+        const position = objectPositionKey(object);
+        const className = objectClassName(object);
         if (position) {
             parts.push(position);
         }
@@ -2641,6 +2647,11 @@
                 });
             },
 
+            testButterfly() {
+                cleanerLog("Testing nearest butterfly capture");
+                return this.catchNearestButterfly();
+            },
+
             inspectInteractionMethods(targetOrId) {
                 let target =
                     targetOrId;
@@ -3231,6 +3242,9 @@
                 const availability =
                     checkButterflyTargetAvailability(target);
 
+                const InteractAction =
+                    getInteractActionClass();
+
                 if (
                     !avatar ||
                     typeof avatar.addAction !== "function"
@@ -3244,8 +3258,8 @@
                     return false;
                 }
 
-                if (typeof target?.startInteraction !== "function") {
-                    this._registerFailure(targetId, "missing butterfly startInteraction");
+                if (!InteractAction) {
+                    this._registerFailure(targetId, "missing butterfly InteractAction");
                     return false;
                 }
 
@@ -3341,28 +3355,23 @@
                             target.readyInteract() === true
                         ) {
                             interactionStarted = true;
-                            cleanerLog(`Butterfly ready; starting native interaction ${targetId}`);
+                            cleanerLog(`Butterfly ready; adding InteractAction ${targetId}`);
 
-                            const interactionPoint =
-                                getRawTargetInteractionPoint(
+                            const action =
+                                new InteractAction(
                                     target,
-                                    avatar
+                                    null
                                 );
 
-                            if (interactionPoint) {
-                                target.startInteraction(
-                                    interactionPoint
-                                );
-                            } else {
-                                target.startInteraction();
-                            }
+                            this._activeAction = action;
+                            avatar.addAction(action);
 
                             this._watchInteraction(token, target, null, startedAt);
                             return;
                         }
                     } catch (error) {
-                        cleanerWarn(`Butterfly startInteraction failed: ${targetId}`, error);
-                        this._completeInteraction(token, "butterfly startInteraction exception", false);
+                        cleanerWarn(`Butterfly InteractAction failed: ${targetId}`, error);
+                        this._completeInteraction(token, "butterfly InteractAction exception", false);
                         return;
                     }
 
@@ -5300,7 +5309,7 @@
             },
             {
                 section: "Map cleaner",
-                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.catchNearestButterfly(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.getRawCandidate(), __AVA_MAP_CLEANER__.inspectInteractionMethods(), __AVA_MAP_CLEANER__.uninstall()"
+                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.testButterfly(), __AVA_MAP_CLEANER__.catchNearestButterfly(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.getRawCandidate(), __AVA_MAP_CLEANER__.inspectInteractionMethods(), __AVA_MAP_CLEANER__.uninstall()"
             },
             {
                 section: "Auto clean loop",
