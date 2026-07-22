@@ -2611,7 +2611,7 @@
                 return table;
             },
 
-            catchNearestButterfly() {
+            catchNearestButterfly(options = {}) {
                 if (this.busy) {
                     return Promise.reject(
                         new Error("Interaction already running")
@@ -2619,7 +2619,7 @@
                 }
 
                 const target =
-                    this._findNearestButterfly();
+                    this._findNearestButterfly(options);
 
                 if (!target) {
                     return Promise.reject(
@@ -2649,7 +2649,10 @@
 
             testButterfly() {
                 cleanerLog("Testing nearest butterfly capture");
-                return this.catchNearestButterfly();
+                this._resetButterflyState();
+                return this.catchNearestButterfly({
+                    ignoreCleanerState: true
+                });
             },
 
             inspectInteractionMethods(targetOrId) {
@@ -2857,7 +2860,29 @@
                 );
             },
 
-            _findNearestButterfly() {
+            _resetButterflyState() {
+                const targets =
+                    discoverCleanableObjects(this.config)
+                        .filter(isButterflyTarget);
+
+                for (const target of targets) {
+                    const targetId =
+                        stableObjectId(target);
+
+                    this._completedObjects.delete(targetId);
+                    this._skippedObjects.delete(targetId);
+                    this._inactiveObjects.delete(targetId);
+                    this._pendingObjects.delete(targetId);
+                    this._attempts.delete(targetId);
+                }
+
+                cleanerLog(`Butterfly test state reset: ${targets.length} candidate${targets.length === 1 ? "" : "s"}`);
+            },
+
+            _findNearestButterfly(options = {}) {
+                const ignoreCleanerState =
+                    options.ignoreCleanerState === true;
+
                 const targets =
                     discoverCleanableObjects(this.config)
                         .filter(target => {
@@ -2866,9 +2891,14 @@
 
                             return (
                                 isButterflyTarget(target) &&
-                                !this._completedObjects.has(targetId) &&
-                                !this._skippedObjects.has(targetId) &&
-                                !this._inactiveObjects.has(targetId) &&
+                                (
+                                    ignoreCleanerState ||
+                                    (
+                                        !this._completedObjects.has(targetId) &&
+                                        !this._skippedObjects.has(targetId) &&
+                                        !this._inactiveObjects.has(targetId)
+                                    )
+                                ) &&
                                 !isExcludedObject(target, this.config) &&
                                 isCleanableObject(target, this.config) &&
                                 checkButterflyTargetAvailability(target).available
