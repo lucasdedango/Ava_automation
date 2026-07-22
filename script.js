@@ -1151,26 +1151,91 @@
         }
     }
 
-    let cachedEnergyRoot = null;
+    let cachedEnergyRoots = [];
     let cachedEnergyField = null;
 
-    function energyRoot() {
-        try {
-            return w.penzville?.city?.Context?.J?.Ele?.Ey ?? null;
-        } catch {
-            return null;
+    function energyDebug(message, data = null) {
+        if (data !== null) {
+            console.log(`[Energy] ${message}`, data);
+        } else {
+            console.log(`[Energy] ${message}`);
         }
     }
 
-    function readEnergyText(field) {
+    function addEnergyRootCandidate(list, value) {
+        if (!value || (typeof value !== "object" && typeof value !== "function")) {
+            return;
+        }
+
+        let root = value;
+
         try {
-            const text =
-                field?.text ??
-                field?.__text ??
+            let cursor = value;
+            let guard = 0;
+
+            while (
+                cursor?.parent &&
+                cursor.parent !== cursor &&
+                guard < 50
+            ) {
+                cursor = cursor.parent;
+                guard++;
+            }
+
+            if (cursor && (typeof cursor === "object" || typeof cursor === "function")) {
+                root = cursor;
+            }
+        } catch {}
+
+        for (const candidate of [root, value]) {
+            if (
+                candidate &&
+                (typeof candidate === "object" || typeof candidate === "function") &&
+                !list.includes(candidate)
+            ) {
+                list.push(candidate);
+            }
+        }
+    }
+
+    function energyRoots() {
+        const roots = [];
+
+        try {
+            const context =
+                w.penzville?.city?.Context ??
                 null;
 
-            return typeof text === "string"
-                ? text.trim()
+            const hud =
+                context?.J ??
+                null;
+
+            addEnergyRootCandidate(roots, hud);
+            addEnergyRootCandidate(roots, hud?.stage);
+            addEnergyRootCandidate(roots, hud?.root);
+            addEnergyRootCandidate(roots, hud?.Ele);
+            addEnergyRootCandidate(roots, hud?.Ele?.Ey);
+            addEnergyRootCandidate(roots, context?.currentLocation?.display);
+            addEnergyRootCandidate(roots, context?.currentLocation?.view);
+            addEnergyRootCandidate(roots, w.openfl?.Lib?.current?.stage);
+            addEnergyRootCandidate(roots, w.openfl?.Lib?.current);
+        } catch {}
+
+        return roots;
+    }
+
+    function readEnergyText(field) {
+        if (!field) {
+            return null;
+        }
+
+        try {
+            const text =
+                String(field.text ?? field.__text ?? "")
+                    .trim();
+
+            return /^\d+\s*\/\s*\d+$/.test(text)
+                ? text
                 : null;
         } catch {
             return null;
@@ -1199,7 +1264,9 @@
         if (
             !Number.isFinite(current) ||
             !Number.isFinite(max) ||
-            max <= 0
+            max <= 0 ||
+            current < 0 ||
+            current > max
         ) {
             return null;
         }
@@ -1218,37 +1285,83 @@
         );
     }
 
+    function pushDisplayChildren(stack, object) {
+        let children = null;
+
+        try {
+            children =
+                object?.__children ??
+                object?.children ??
+                null;
+        } catch {
+            children = null;
+        }
+
+        if (children && typeof children.length === "number") {
+            for (let index = children.length - 1; index >= 0; index--) {
+                try {
+                    const child =
+                        children[index];
+
+                    if (child) {
+                        stack.push(child);
+                    }
+                } catch {}
+            }
+        }
+
+        try {
+            if (
+                typeof object?.numChildren === "number" &&
+                typeof object?.getChildAt === "function"
+            ) {
+                for (let index = object.numChildren - 1; index >= 0; index--) {
+                    try {
+                        const child =
+                            object.getChildAt(index);
+
+                        if (child) {
+                            stack.push(child);
+                        }
+                    } catch {}
+                }
+            }
+        } catch {}
+    }
+
     function findEnergyField() {
-        const root =
-            energyRoot();
-
-        if (!root || typeof root !== "object") {
-            cachedEnergyRoot = null;
-            cachedEnergyField = null;
-            return null;
-        }
-
-        if (cachedEnergyRoot !== root) {
-            cachedEnergyRoot = root;
-            cachedEnergyField = null;
-        }
-
         if (energyFromField(cachedEnergyField)) {
             return cachedEnergyField;
         }
 
-        cachedEnergyField = null;
+        if (cachedEnergyField) {
+            energyDebug("Cached field invalid, refreshing...");
+        }
 
-        const stack = [root];
+        cachedEnergyField = null;
+        cachedEnergyRoots = energyRoots();
+
+        if (cachedEnergyRoots.length === 0) {
+            return null;
+        }
+
+        energyDebug("Searching field...");
+
+        const stack =
+            cachedEnergyRoots.slice();
         const seen = new WeakSet();
-        const maxNodes = 3000;
+        const maxNodes = 10000;
         let inspected = 0;
 
         while (stack.length > 0 && inspected < maxNodes) {
             const value =
                 stack.pop();
 
-            if (!value || typeof value !== "object" || seen.has(value)) {
+            if (
+                !value ||
+                (typeof value !== "object" && typeof value !== "function") ||
+                seen.has(value)
+            ) {
                 continue;
             }
 
@@ -1256,43 +1369,42 @@
             inspected++;
 
             if (energyFromField(value)) {
-                cachedEnergyRoot = root;
                 cachedEnergyField = value;
+                energyDebug("Field found");
                 return value;
             }
 
-            let keys = [];
-
-            try {
-                keys = Object.getOwnPropertyNames(value);
-            } catch {
-                keys = [];
-            }
-
-            for (const key of keys) {
-                try {
-                    const child =
-                        value[key];
-
-                    if (child && typeof child === "object") {
-                        stack.push(child);
-                    }
-                } catch {}
-            }
+            pushDisplayChildren(stack, value);
         }
 
         return null;
     }
 
-    function getEnergy() {
-        const field =
-            findEnergyField();
+    function refreshEnergyField() {
+        cachedEnergyField = null;
+        return findEnergyField();
+    }
 
-        if (!field) {
-            return null;
+    function getEnergy() {
+        let field =
+            cachedEnergyField;
+
+        let energy =
+            energyFromField(field);
+
+        if (!energy) {
+            field =
+                findEnergyField();
+
+            energy =
+                energyFromField(field);
         }
 
-        return energyFromField(field);
+        if (energy) {
+            energyDebug(`Current: ${energy.current}/${energy.max}`);
+        }
+
+        return energy;
     }
 
     function formatEnergy(energy) {
@@ -2750,6 +2862,22 @@
                 return findEnergyField();
             },
 
+            refreshEnergyField() {
+                const field =
+                    refreshEnergyField();
+
+                cleanerLog(
+                    "Energy field refreshed",
+                    {
+                        field,
+                        energy:
+                            this.getEnergy()
+                    }
+                );
+
+                return field;
+            },
+
             getEnergy() {
                 return getEnergy();
             },
@@ -3120,6 +3248,41 @@
                 cleanerLog(`Butterfly test state reset: ${targets.length} candidate${targets.length === 1 ? "" : "s"}`);
             },
 
+            _deferButterflyTarget(targetId, target, reason) {
+                if (!targetId) {
+                    return;
+                }
+
+                const now =
+                    Date.now();
+
+                const previous =
+                    this._pendingObjects.get(targetId);
+
+                this._pendingObjects.set(
+                    targetId,
+                    {
+                        target,
+                        reason:
+                            reason || "butterfly temporarily unavailable",
+                        firstSeenAt:
+                            previous?.firstSeenAt ??
+                            now,
+                        lastSeenAt:
+                            now,
+                        unavailableCount:
+                            (previous?.unavailableCount ?? 0) + 1,
+                        retryAfter:
+                            now + this.config.butterflySwitchDelayMs
+                    }
+                );
+
+                cleanerLog(
+                    `Butterfly deferred ${targetId}`,
+                    reason || "temporarily unavailable"
+                );
+            },
+
             _captureAllButterflies() {
                 const targets =
                     discoverCleanableObjects(this.config)
@@ -3188,9 +3351,18 @@
                     }
 
                     if (!target) {
-                        return Promise.reject(
-                            new Error("No retryable butterfly found")
-                        );
+                        cleanerLog("No retryable butterfly currently available; waiting before retry");
+
+                        return new Promise((resolve, reject) => {
+                            this._setTimer(
+                                () => {
+                                    captureNext()
+                                        .then(resolve)
+                                        .catch(reject);
+                                },
+                                this.config.butterflySwitchDelayMs
+                            );
+                        });
                     }
 
                     const targetId =
@@ -3206,6 +3378,11 @@
                                 failedRound.delete(targetId);
                             } else {
                                 failedRound.add(targetId);
+                                this._deferButterflyTarget(
+                                    targetId,
+                                    target,
+                                    result?.reason || "butterfly retry needed"
+                                );
                             }
 
                             return new Promise(resolve => {
@@ -3218,6 +3395,11 @@
                         .catch(error => {
                             cleanerWarn(`Butterfly attempt failed: ${targetId}`, error);
                             failedRound.add(targetId);
+                            this._deferButterflyTarget(
+                                targetId,
+                                target,
+                                error?.message || "butterfly attempt failed"
+                            );
 
                             return new Promise((resolve, reject) => {
                                 this._setTimer(
@@ -3252,6 +3434,12 @@
                         .filter(target => {
                             const targetId =
                                 stableObjectId(target);
+                            const pending =
+                                this._pendingObjects.get(targetId);
+                            const pendingReady =
+                                !pending ||
+                                !pending.retryAfter ||
+                                Date.now() >= pending.retryAfter;
 
                             return (
                                 isButterflyTarget(target) &&
@@ -3260,6 +3448,7 @@
                                     targetIds.has(targetId)
                                 ) &&
                                 !excludeIds.has(targetId) &&
+                                pendingReady &&
                                 (
                                     ignoreCleanerState ||
                                     (
@@ -3823,9 +4012,24 @@
                     return;
                 }
                 if (performance.now() - startedAt > this.config.interactionTimeout) {
-                    const targetAvailability = checkTargetAvailability(target);
+                    const butterflyTarget =
+                        isButterflyTarget(target);
+                    const targetAvailability = butterflyTarget
+                        ? checkButterflyTargetAvailability(target)
+                        : checkTargetAvailability(target);
 
                     if (!targetAvailability.available) {
+                        if (butterflyTarget) {
+                            this._deferButterflyTarget(
+                                targetId,
+                                target,
+                                targetAvailability.reason
+                            );
+                            cleanerLog(`Deferred butterfly after timeout: ${targetId}`);
+                            this._completeInteraction(token, "timeout unavailable butterfly", null);
+                            return;
+                        }
+
                         this._markInactiveTarget(targetId, targetAvailability.reason);
                         cleanerLog(`Skipped inactive target after timeout: ${targetId}`);
                         this._completeInteraction(token, "timeout inactive target", null);
@@ -3845,6 +4049,17 @@
                     }
 
                     cleanerWarn(`Interaction timeout: ${targetId}`);
+
+                    if (butterflyTarget) {
+                        this._deferButterflyTarget(
+                            targetId,
+                            target,
+                            "butterfly timeout"
+                        );
+                        this._completeInteraction(token, "butterfly timeout", null);
+                        return;
+                    }
+
                     this._completeInteraction(token, "timeout", false);
                     return;
                 }
@@ -5751,7 +5966,7 @@
             },
             {
                 section: "Map cleaner",
-                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.getStatus(), __AVA_MAP_CLEANER__.getEnergy(), __AVA_MAP_CLEANER__.testButterfly(), __AVA_MAP_CLEANER__.catchNearestButterfly(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.getRawCandidate(), __AVA_MAP_CLEANER__.inspectInteractionMethods(), __AVA_MAP_CLEANER__.uninstall()"
+                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.getStatus(), __AVA_MAP_CLEANER__.getEnergy(), __AVA_MAP_CLEANER__.refreshEnergyField(), __AVA_MAP_CLEANER__.testButterfly(), __AVA_MAP_CLEANER__.catchNearestButterfly(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.getRawCandidate(), __AVA_MAP_CLEANER__.inspectInteractionMethods(), __AVA_MAP_CLEANER__.uninstall()"
             },
             {
                 section: "Auto clean loop",
