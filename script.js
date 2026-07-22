@@ -29,6 +29,7 @@
      */
     const AVA_AUTO_CLEAN_LOOP_ON = false;
     const AVA_AUTO_CLEAN_LOOP_IDLE_MS = 70 * 60 * 1000;
+    const MIN_ENERGY_TO_ACT = 10;
 
     const AVA_STARTUP_WATCHDOG_ON = true;
     const AVA_STARTUP_WATCHDOG_OPTIONS = {
@@ -1148,6 +1149,158 @@
         } else {
             console.warn(`[AVA CLEANER] ${message}`);
         }
+    }
+
+    let cachedEnergyRoot = null;
+    let cachedEnergyField = null;
+
+    function energyRoot() {
+        try {
+            return w.penzville?.city?.Context?.J?.Ele?.Ey ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    function readEnergyText(field) {
+        try {
+            const text =
+                field?.text ??
+                field?.__text ??
+                null;
+
+            return typeof text === "string"
+                ? text.trim()
+                : null;
+        } catch {
+            return null;
+        }
+    }
+
+    function parseEnergyText(text) {
+        if (!/^\d+\s*\/\s*\d+$/.test(String(text ?? ""))) {
+            return null;
+        }
+
+        const match =
+            String(text)
+                .match(/^(\d+)\s*\/\s*(\d+)$/);
+
+        if (!match) {
+            return null;
+        }
+
+        const current =
+            Number(match[1]);
+
+        const max =
+            Number(match[2]);
+
+        if (
+            !Number.isFinite(current) ||
+            !Number.isFinite(max) ||
+            max <= 0
+        ) {
+            return null;
+        }
+
+        return {
+            current,
+            max,
+            percent:
+                Math.round((current / max) * 100)
+        };
+    }
+
+    function energyFromField(field) {
+        return parseEnergyText(
+            readEnergyText(field)
+        );
+    }
+
+    function findEnergyField() {
+        const root =
+            energyRoot();
+
+        if (!root || typeof root !== "object") {
+            cachedEnergyRoot = null;
+            cachedEnergyField = null;
+            return null;
+        }
+
+        if (cachedEnergyRoot !== root) {
+            cachedEnergyRoot = root;
+            cachedEnergyField = null;
+        }
+
+        if (energyFromField(cachedEnergyField)) {
+            return cachedEnergyField;
+        }
+
+        cachedEnergyField = null;
+
+        const stack = [root];
+        const seen = new WeakSet();
+        const maxNodes = 3000;
+        let inspected = 0;
+
+        while (stack.length > 0 && inspected < maxNodes) {
+            const value =
+                stack.pop();
+
+            if (!value || typeof value !== "object" || seen.has(value)) {
+                continue;
+            }
+
+            seen.add(value);
+            inspected++;
+
+            if (energyFromField(value)) {
+                cachedEnergyRoot = root;
+                cachedEnergyField = value;
+                return value;
+            }
+
+            let keys = [];
+
+            try {
+                keys = Object.getOwnPropertyNames(value);
+            } catch {
+                keys = [];
+            }
+
+            for (const key of keys) {
+                try {
+                    const child =
+                        value[key];
+
+                    if (child && typeof child === "object") {
+                        stack.push(child);
+                    }
+                } catch {}
+            }
+        }
+
+        return null;
+    }
+
+    function getEnergy() {
+        const field =
+            findEnergyField();
+
+        if (!field) {
+            return null;
+        }
+
+        return energyFromField(field);
+    }
+
+    function formatEnergy(energy) {
+        if (!energy) {
+            return "unknown";
+        }
+
+        return `${energy.current}/${energy.max}`;
     }
 
     function getLocationAvatarClass() {
@@ -2452,6 +2605,7 @@
             },
             running: false,
             paused: false,
+            pauseReason: null,
             busy: false,
             currentMap: null,
             currentTarget: null,
@@ -2486,6 +2640,7 @@
                 installAvatarCapture();
                 this.running = true;
                 this.paused = false;
+                this.pauseReason = null;
                 this.busy = false;
                 this.currentTarget = null;
                 this.cleanedObjects = 0;
@@ -2514,6 +2669,7 @@
             stop() {
                 this.running = false;
                 this.paused = false;
+                this.pauseReason = null;
                 this._clearTimers();
                 this._restoreWrappedTargets();
                 this._rejectManualInteraction("cleaner stopped");
@@ -2522,9 +2678,10 @@
                 return this.status();
             },
 
-            pause() {
+            pause(reason = "manual") {
                 this.paused = true;
-                cleanerLog("Paused");
+                this.pauseReason = reason;
+                cleanerLog(reason === "energy" ? "Paused: energy" : "Paused");
                 return this.status();
             },
 
@@ -2532,23 +2689,47 @@
                 if (!this.running) {
                     return false;
                 }
+
+                const energy =
+                    this.getEnergy();
+
+                if (
+                    energy &&
+                    energy.current < MIN_ENERGY_TO_ACT
+                ) {
+                    cleanerWarn(`Cannot resume: energy is still ${formatEnergy(energy)}.`);
+                    this.paused = true;
+                    this.pauseReason = "energy";
+                    return this.status();
+                }
+
+                if (!this.paused) {
+                    return this.status();
+                }
+
                 this.paused = false;
+                this.pauseReason = null;
                 this._emptyScans = 0;
-                cleanerLog("Resumed");
+                cleanerLog(energy ? `Energy restored: ${formatEnergy(energy)}. Resuming.` : "Resumed");
                 this._scheduleScan(0);
-                return true;
+                return this.status();
             },
 
             status() {
+                const energy =
+                    this.getEnergy();
+
                 return {
                     running: this.running,
                     paused: this.paused,
+                    pauseReason: this.pauseReason,
                     busy: this.busy,
                     currentMap: this.currentMap,
                     currentTarget: this.currentTarget ? stableObjectId(this.currentTarget) : null,
                     cleanedObjects: this.cleanedObjects,
                     failedObjects: this.failedObjects,
                     remainingTargets: this.remainingTargets,
+                    queueLength: this.remainingTargets,
                     pendingTargets: this._pendingObjects.size,
                     inactiveTargets: this._inactiveObjects.size,
                     targetSelectionMode: this.config.targetSelectionMode,
@@ -2556,8 +2737,21 @@
                     visitedMaps: this.visitedMaps.slice(),
                     interactionToken: this.interactionToken,
                     totalAttempts: this.totalAttempts,
+                    energy,
                     durationMs: this.startedAt ? Math.round(performance.now() - this.startedAt) : 0
                 };
+            },
+
+            getStatus() {
+                return this.status();
+            },
+
+            findEnergyField() {
+                return findEnergyField();
+            },
+
+            getEnergy() {
+                return getEnergy();
             },
 
             inspectCandidates() {
@@ -2715,6 +2909,49 @@
                     attempts: this.totalAttempts,
                     durationMs: this.startedAt ? Math.round(performance.now() - this.startedAt) : 0
                 };
+            },
+
+            _logEnergyBeforeAction() {
+                const energy =
+                    this.getEnergy();
+
+                if (energy) {
+                    cleanerLog(`Energy: ${formatEnergy(energy)}`);
+                }
+
+                return energy;
+            },
+
+            _logEnergyAfterAction() {
+                const energy =
+                    this.getEnergy();
+
+                if (energy) {
+                    cleanerLog(`Energy after action: ${formatEnergy(energy)}`);
+                }
+
+                return energy;
+            },
+
+            _pauseForEnergy(energy = this.getEnergy()) {
+                this.paused = true;
+                this.pauseReason = "energy";
+                cleanerWarn(`Not enough energy: ${formatEnergy(energy)}. Bot paused.`);
+                return false;
+            },
+
+            _canStartEnergyAction() {
+                const energy =
+                    this._logEnergyBeforeAction();
+
+                if (
+                    energy &&
+                    energy.current < MIN_ENERGY_TO_ACT
+                ) {
+                    return this._pauseForEnergy(energy);
+                }
+
+                return true;
             },
 
             _rejectManualInteraction(reason) {
@@ -3352,6 +3589,11 @@
                     this._scheduleScan(100);
                     return false;
                 }
+
+                if (!this._canStartEnergyAction()) {
+                    return false;
+                }
+
                 const attempt = (this._attempts.get(targetId) ?? 0) + 1;
                 this._attempts.set(targetId, attempt);
                 this.totalAttempts++;
@@ -3435,6 +3677,10 @@
 
                 if (!InteractAction) {
                     this._registerFailure(targetId, "missing butterfly InteractAction");
+                    return false;
+                }
+
+                if (!this._canStartEnergyAction()) {
                     return false;
                 }
 
@@ -3529,6 +3775,11 @@
                             typeof target.readyInteract === "function" &&
                             target.readyInteract() === true
                         ) {
+                            if (!this._canStartEnergyAction()) {
+                                this._completeInteraction(token, "energy paused", null);
+                                return;
+                            }
+
                             interactionStarted = true;
                             cleanerLog(`Butterfly ready; adding InteractAction ${targetId}`);
 
@@ -3581,6 +3832,18 @@
                         return;
                     }
 
+                    const energy =
+                        this.getEnergy();
+
+                    if (
+                        energy &&
+                        energy.current < MIN_ENERGY_TO_ACT
+                    ) {
+                        this._pauseForEnergy(energy);
+                        this._completeInteraction(token, "timeout with low energy", null);
+                        return;
+                    }
+
                     cleanerWarn(`Interaction timeout: ${targetId}`);
                     this._completeInteraction(token, "timeout", false);
                     return;
@@ -3609,6 +3872,10 @@
                     cleanerLog(`Completed ${targetId ?? "object"}`);
                 } else if (success === false && targetId) {
                     this._registerFailure(targetId, reason);
+                }
+
+                if (targetId) {
+                    this._logEnergyAfterAction();
                 }
 
                 const manual =
@@ -5484,7 +5751,7 @@
             },
             {
                 section: "Map cleaner",
-                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.testButterfly(), __AVA_MAP_CLEANER__.catchNearestButterfly(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.getRawCandidate(), __AVA_MAP_CLEANER__.inspectInteractionMethods(), __AVA_MAP_CLEANER__.uninstall()"
+                commands: "__AVA_MAP_CLEANER__.start(), __AVA_MAP_CLEANER__.stop(), __AVA_MAP_CLEANER__.pause(), __AVA_MAP_CLEANER__.resume(), __AVA_MAP_CLEANER__.status(), __AVA_MAP_CLEANER__.getStatus(), __AVA_MAP_CLEANER__.getEnergy(), __AVA_MAP_CLEANER__.testButterfly(), __AVA_MAP_CLEANER__.catchNearestButterfly(), __AVA_MAP_CLEANER__.inspectCandidates(), __AVA_MAP_CLEANER__.listDetectedTypes(), __AVA_MAP_CLEANER__.getRawCandidate(), __AVA_MAP_CLEANER__.inspectInteractionMethods(), __AVA_MAP_CLEANER__.uninstall()"
             },
             {
                 section: "Auto clean loop",
@@ -5582,6 +5849,10 @@
                     w.__AVA_MAP_CLEANER__?.paused ??
                     false,
 
+                mapCleanerPauseReason:
+                    w.__AVA_MAP_CLEANER__?.pauseReason ??
+                    null,
+
                 mapCleanerBusy:
                     w.__AVA_MAP_CLEANER__?.busy ??
                     false,
@@ -5608,6 +5879,10 @@
 
                 mapCleanerTargetSelectionMode:
                     w.__AVA_MAP_CLEANER__?.config?.targetSelectionMode ??
+                    null,
+
+                mapCleanerEnergy:
+                    w.__AVA_MAP_CLEANER__?.getEnergy?.() ??
                     null,
 
                 autoCleanLoopEnabled:
