@@ -2446,7 +2446,9 @@
                 maxWorldScanObjects: 6000,
                 debugInteractionMethods: false,
                 butterflyReadyPollMs: 150,
-                butterflyMoveRefreshMs: 800
+                butterflyMoveRefreshMs: 800,
+                butterflySwitchDelayMs: 750,
+                butterflyFullCaptureTimeoutMs: 60000
             },
             running: false,
             paused: false,
@@ -2627,6 +2629,10 @@
                     );
                 }
 
+                return this._captureButterflyTarget(target);
+            },
+
+            _captureButterflyTarget(target) {
                 return new Promise((resolve, reject) => {
                     const started =
                         this._startButterflyInteraction(
@@ -2648,11 +2654,9 @@
             },
 
             testButterfly() {
-                cleanerLog("Testing nearest butterfly capture");
+                cleanerLog("Testing full butterfly capture");
                 this._resetButterflyState();
-                return this.catchNearestButterfly({
-                    ignoreCleanerState: true
-                });
+                return this._captureAllButterflies();
             },
 
             inspectInteractionMethods(targetOrId) {
@@ -2879,9 +2883,132 @@
                 cleanerLog(`Butterfly test state reset: ${targets.length} candidate${targets.length === 1 ? "" : "s"}`);
             },
 
+            _captureAllButterflies() {
+                const targets =
+                    discoverCleanableObjects(this.config)
+                        .filter(target =>
+                            isButterflyTarget(target) &&
+                            !isExcludedObject(target, this.config) &&
+                            isCleanableObject(target, this.config) &&
+                            checkButterflyTargetAvailability(target).available
+                        );
+
+                const targetIds =
+                    Array.from(
+                        new Set(
+                            targets.map(stableObjectId)
+                        )
+                    );
+
+                cleanerLog(`${targetIds.length} butterfly candidate${targetIds.length === 1 ? "" : "s"} found`);
+
+                if (targetIds.length === 0) {
+                    return Promise.reject(
+                        new Error("No valid butterfly found")
+                    );
+                }
+
+                const startedAt =
+                    performance.now();
+
+                const failedRound =
+                    new Set();
+
+                const captureNext = () => {
+                    const remainingIds =
+                        targetIds.filter(targetId =>
+                            !this._completedObjects.has(targetId)
+                        );
+
+                    if (remainingIds.length === 0) {
+                        return Promise.resolve({
+                            completed: targetIds.slice(),
+                            count: targetIds.length
+                        });
+                    }
+
+                    if (
+                        performance.now() - startedAt >
+                        this.config.butterflyFullCaptureTimeoutMs
+                    ) {
+                        return Promise.reject(
+                            new Error("Butterfly full capture timeout")
+                        );
+                    }
+
+                    let target =
+                        this._findNearestButterfly({
+                            targetIds: remainingIds,
+                            excludeIds: failedRound
+                        });
+
+                    if (!target && failedRound.size > 0) {
+                        failedRound.clear();
+                        target =
+                            this._findNearestButterfly({
+                                targetIds: remainingIds
+                            });
+                    }
+
+                    if (!target) {
+                        return Promise.reject(
+                            new Error("No retryable butterfly found")
+                        );
+                    }
+
+                    const targetId =
+                        stableObjectId(target);
+
+                    cleanerLog(
+                        `Trying butterfly ${targetId} (${targetIds.length - remainingIds.length + 1}/${targetIds.length})`
+                    );
+
+                    return this._captureButterflyTarget(target)
+                        .then(result => {
+                            if (result?.completed === true) {
+                                failedRound.delete(targetId);
+                            } else {
+                                failedRound.add(targetId);
+                            }
+
+                            return new Promise(resolve => {
+                                this._setTimer(
+                                    () => resolve(captureNext()),
+                                    this.config.butterflySwitchDelayMs
+                                );
+                            });
+                        })
+                        .catch(error => {
+                            cleanerWarn(`Butterfly attempt failed: ${targetId}`, error);
+                            failedRound.add(targetId);
+
+                            return new Promise((resolve, reject) => {
+                                this._setTimer(
+                                    () => {
+                                        captureNext()
+                                            .then(resolve)
+                                            .catch(reject);
+                                    },
+                                    this.config.butterflySwitchDelayMs
+                                );
+                            });
+                        });
+                };
+
+                return captureNext();
+            },
+
             _findNearestButterfly(options = {}) {
                 const ignoreCleanerState =
                     options.ignoreCleanerState === true;
+                const targetIds =
+                    options.targetIds instanceof Set
+                        ? options.targetIds
+                        : new Set(options.targetIds ?? []);
+                const excludeIds =
+                    options.excludeIds instanceof Set
+                        ? options.excludeIds
+                        : new Set(options.excludeIds ?? []);
 
                 const targets =
                     discoverCleanableObjects(this.config)
@@ -2891,6 +3018,11 @@
 
                             return (
                                 isButterflyTarget(target) &&
+                                (
+                                    targetIds.size === 0 ||
+                                    targetIds.has(targetId)
+                                ) &&
+                                !excludeIds.has(targetId) &&
                                 (
                                     ignoreCleanerState ||
                                     (
@@ -3113,8 +3245,21 @@
                     return;
                 }
 
+                const selectableTargets =
+                    this.currentMap === "garden"
+                        ? (
+                            availableTargets.some(target => !isButterflyTarget(target))
+                                ? availableTargets.filter(target => !isButterflyTarget(target))
+                                : availableTargets
+                        )
+                        : availableTargets;
+
+                if (selectableTargets.length !== availableTargets.length) {
+                    cleanerLog("Garden static targets first; butterflies postponed");
+                }
+
                 const rankedTargets =
-                    this._rankAvailableTargets(availableTargets);
+                    this._rankAvailableTargets(selectableTargets);
 
                 const next =
                     rankedTargets[0];
