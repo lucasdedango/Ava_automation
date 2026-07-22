@@ -1224,6 +1224,22 @@
         return roots;
     }
 
+    function energyTextFormat(text) {
+        const value =
+            String(text ?? "")
+                .trim();
+
+        if (/^\d+\s*\/\s*\d+$/.test(value)) {
+            return "fraction";
+        }
+
+        if (/^\d+$/.test(value)) {
+            return "overflow";
+        }
+
+        return null;
+    }
+
     function readEnergyText(field) {
         if (!field) {
             return null;
@@ -1234,7 +1250,7 @@
                 String(field.text ?? field.__text ?? "")
                     .trim();
 
-            return /^\d+\s*\/\s*\d+$/.test(text)
+            return energyTextFormat(text)
                 ? text
                 : null;
         } catch {
@@ -1242,31 +1258,60 @@
         }
     }
 
+    function logDetectedEnergyFormat(text) {
+        const format =
+            energyTextFormat(text);
+
+        if (format === "fraction") {
+            energyDebug(`Detected "${text}" format`);
+            return;
+        }
+
+        if (format === "overflow") {
+            energyDebug(`Detected overflow format: "${text}"`);
+        }
+    }
+
     function parseEnergyText(text) {
-        if (!/^\d+\s*\/\s*\d+$/.test(String(text ?? ""))) {
+        const value =
+            String(text ?? "")
+                .trim();
+
+        const format =
+            energyTextFormat(value);
+
+        if (!format) {
             return null;
         }
 
-        const match =
-            String(text)
-                .match(/^(\d+)\s*\/\s*(\d+)$/);
+        let current;
+        let max;
 
-        if (!match) {
-            return null;
+        if (format === "fraction") {
+            const match =
+                value.match(/^(\d+)\s*\/\s*(\d+)$/);
+
+            if (!match) {
+                return null;
+            }
+
+            current =
+                Number(match[1]);
+
+            max =
+                Number(match[2]);
+        } else {
+            current =
+                Number(value);
+
+            max = 100;
         }
-
-        const current =
-            Number(match[1]);
-
-        const max =
-            Number(match[2]);
 
         if (
             !Number.isFinite(current) ||
             !Number.isFinite(max) ||
             max <= 0 ||
-            current < 0 ||
-            current > max
+            current < 0
         ) {
             return null;
         }
@@ -1352,6 +1397,8 @@
         const seen = new WeakSet();
         const maxNodes = 10000;
         let inspected = 0;
+        let overflowFallback = null;
+        let overflowFallbackText = null;
 
         while (stack.length > 0 && inspected < maxNodes) {
             const value =
@@ -1368,13 +1415,31 @@
             seen.add(value);
             inspected++;
 
-            if (energyFromField(value)) {
-                cachedEnergyField = value;
-                energyDebug("Field found");
-                return value;
+            const text =
+                readEnergyText(value);
+
+            if (text) {
+                if (energyTextFormat(text) === "fraction") {
+                    cachedEnergyField = value;
+                    energyDebug("Field found");
+                    logDetectedEnergyFormat(text);
+                    return value;
+                }
+
+                if (!overflowFallback) {
+                    overflowFallback = value;
+                    overflowFallbackText = text;
+                }
             }
 
             pushDisplayChildren(stack, value);
+        }
+
+        if (overflowFallback) {
+            cachedEnergyField = overflowFallback;
+            energyDebug("Field found");
+            logDetectedEnergyFormat(overflowFallbackText);
+            return overflowFallback;
         }
 
         return null;
