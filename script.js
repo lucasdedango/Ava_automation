@@ -1233,10 +1233,6 @@
             return "fraction";
         }
 
-        if (/^\d+$/.test(value)) {
-            return "overflow";
-        }
-
         return null;
     }
 
@@ -1259,16 +1255,8 @@
     }
 
     function logDetectedEnergyFormat(text) {
-        const format =
-            energyTextFormat(text);
-
-        if (format === "fraction") {
+        if (energyTextFormat(text) === "fraction") {
             energyDebug(`Detected "${text}" format`);
-            return;
-        }
-
-        if (format === "overflow") {
-            energyDebug(`Detected overflow format: "${text}"`);
         }
     }
 
@@ -1277,41 +1265,29 @@
             String(text ?? "")
                 .trim();
 
-        const format =
-            energyTextFormat(value);
-
-        if (!format) {
+        if (energyTextFormat(value) !== "fraction") {
             return null;
         }
 
-        let current;
-        let max;
+        const match =
+            value.match(/^(\d+)\s*\/\s*(\d+)$/);
 
-        if (format === "fraction") {
-            const match =
-                value.match(/^(\d+)\s*\/\s*(\d+)$/);
-
-            if (!match) {
-                return null;
-            }
-
-            current =
-                Number(match[1]);
-
-            max =
-                Number(match[2]);
-        } else {
-            current =
-                Number(value);
-
-            max = 100;
+        if (!match) {
+            return null;
         }
+
+        const current =
+            Number(match[1]);
+
+        const max =
+            Number(match[2]);
 
         if (
             !Number.isFinite(current) ||
             !Number.isFinite(max) ||
             max <= 0 ||
-            current < 0
+            current < 0 ||
+            current > max
         ) {
             return null;
         }
@@ -1397,8 +1373,6 @@
         const seen = new WeakSet();
         const maxNodes = 10000;
         let inspected = 0;
-        let overflowFallback = null;
-        let overflowFallbackText = null;
 
         while (stack.length > 0 && inspected < maxNodes) {
             const value =
@@ -1419,29 +1393,16 @@
                 readEnergyText(value);
 
             if (text) {
-                if (energyTextFormat(text) === "fraction") {
-                    cachedEnergyField = value;
-                    energyDebug("Field found");
-                    logDetectedEnergyFormat(text);
-                    return value;
-                }
-
-                if (!overflowFallback) {
-                    overflowFallback = value;
-                    overflowFallbackText = text;
-                }
+                cachedEnergyField = value;
+                energyDebug("Field found");
+                logDetectedEnergyFormat(text);
+                return value;
             }
 
             pushDisplayChildren(stack, value);
         }
 
-        if (overflowFallback) {
-            cachedEnergyField = overflowFallback;
-            energyDebug("Field found");
-            logDetectedEnergyFormat(overflowFallbackText);
-            return overflowFallback;
-        }
-
+        energyDebug("No X/100 field found; energy check ignored");
         return null;
     }
 
@@ -2777,6 +2738,7 @@
                 debugInteractionMethods: false,
                 butterflyReadyPollMs: 150,
                 butterflyMoveRefreshMs: 800,
+                butterflyAttemptWindowMs: 15000,
                 butterflySwitchDelayMs: 750,
                 butterflyFullCaptureTimeoutMs: 60000
             },
@@ -3925,7 +3887,11 @@
                 }
 
                 if (!availability.available) {
-                    this._markInactiveTarget(targetId, availability.reason);
+                    this._deferButterflyTarget(
+                        targetId,
+                        target,
+                        availability.reason
+                    );
                     return false;
                 }
 
@@ -3960,6 +3926,26 @@
                 let interactionStarted = false;
                 const startedAt =
                     performance.now();
+                const attemptWindow =
+                    this.config.butterflyAttemptWindowMs ??
+                    15000;
+
+                const finishAttemptWithoutFailure = reason => {
+                    if (
+                        token !== this.interactionToken ||
+                        !this.busy
+                    ) {
+                        return;
+                    }
+
+                    cleanerWarn(`${reason}: ${targetId}`);
+                    this._deferButterflyTarget(
+                        targetId,
+                        target,
+                        reason
+                    );
+                    this._completeInteraction(token, reason, null);
+                };
 
                 const requestWalk = () => {
                     const now =
@@ -4012,14 +3998,13 @@
 
                     if (
                         performance.now() - startedAt >
-                        this.config.interactionTimeout
+                        attemptWindow
                     ) {
-                        const timeoutReason = interactionStarted
-                            ? "butterfly finish timeout"
-                            : "butterfly ready timeout";
-
-                        cleanerWarn(`${timeoutReason}: ${targetId}`);
-                        this._completeInteraction(token, timeoutReason, false);
+                        finishAttemptWithoutFailure(
+                            interactionStarted
+                                ? "butterfly catch wait timeout"
+                                : "butterfly ready timeout"
+                        );
                         return;
                     }
 
@@ -4046,12 +4031,20 @@
                             this._activeAction = action;
                             avatar.addAction(action);
 
-                            this._watchInteraction(token, target, null, startedAt);
+                            this._setTimer(
+                                () => finishAttemptWithoutFailure("butterfly finish timeout"),
+                                attemptWindow
+                            );
                             return;
                         }
                     } catch (error) {
                         cleanerWarn(`Butterfly InteractAction failed: ${targetId}`, error);
-                        this._completeInteraction(token, "butterfly InteractAction exception", false);
+                        this._deferButterflyTarget(
+                            targetId,
+                            target,
+                            "butterfly InteractAction exception"
+                        );
+                        this._completeInteraction(token, "butterfly InteractAction exception", null);
                         return;
                     }
 
