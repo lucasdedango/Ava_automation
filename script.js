@@ -1306,6 +1306,59 @@
         );
     }
 
+    function energyFieldLooksAttached(field) {
+        if (!field || (typeof field !== "object" && typeof field !== "function")) {
+            return false;
+        }
+
+        if (!readEnergyText(field)) {
+            return false;
+        }
+
+        try {
+            if (field.visible === false) {
+                return false;
+            }
+        } catch {}
+
+        const roots =
+            energyRoots();
+
+        if (roots.includes(field)) {
+            return true;
+        }
+
+        let cursor = field;
+        let guard = 0;
+
+        while (cursor && guard < 80) {
+            let parent = null;
+
+            try {
+                parent =
+                    cursor.parent ??
+                    cursor.__parent ??
+                    null;
+            } catch {
+                parent = null;
+            }
+
+            if (!parent || parent === cursor) {
+                break;
+            }
+
+
+            if (roots.includes(parent)) {
+                return true;
+            }
+
+            cursor = parent;
+            guard++;
+        }
+
+        return false;
+    }
+
     function pushDisplayChildren(stack, object) {
         let children = null;
 
@@ -1351,12 +1404,15 @@
     }
 
     function findEnergyField() {
-        if (energyFromField(cachedEnergyField)) {
+        if (
+            energyFieldLooksAttached(cachedEnergyField) &&
+            energyFromField(cachedEnergyField)
+        ) {
             return cachedEnergyField;
         }
 
         if (cachedEnergyField) {
-            energyDebug("Cached field invalid, refreshing...");
+            energyDebug("Cached field detached or invalid, refreshing...");
         }
 
         cachedEnergyField = null;
@@ -1414,6 +1470,12 @@
     function getEnergy() {
         let field =
             cachedEnergyField;
+
+        if (field && !energyFieldLooksAttached(field)) {
+            energyDebug("Cached field detached, refreshing...");
+            cachedEnergyField = null;
+            field = null;
+        }
 
         let energy =
             energyFromField(field);
@@ -2720,7 +2782,7 @@
                 excludedClasses: [],
                 excludedTypeIds: [],
                 excludedObjectIds: [],
-                excludedKeywords: ["sit"],
+                excludedKeywords: ["sit", "exit"],
                 temporaryUnavailableDelay: 1500,
                 fullRescanInterval: 1000,
                 maxUnavailableScans: 5,
@@ -4375,7 +4437,7 @@
                         maps: this.maps.slice(),
                         detectionMode: "hybrid",
                         targetSelectionMode: "nearest",
-                        excludedKeywords: ["sit"]
+                        excludedKeywords: ["sit", "exit"]
                     });
                 } catch (error) {
                     console.error("[AVA AUTO LOOP] Cleaner start failed", error);
