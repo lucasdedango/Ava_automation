@@ -30,6 +30,7 @@
     const AVA_AUTO_CLEAN_LOOP_ON = false;
     const AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS = 40 * 60 * 1000;
     const AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS = 30 * 60 * 1000;
+    const AVA_AUTO_CLEAN_LOOP_START_TIMEOUT_MS = 60 * 1000;
     const AVA_BUTTERFLY_MAX_ATTEMPTS = 3;
     const MIN_ENERGY_TO_ACT = 10;
 
@@ -4515,6 +4516,7 @@
             startedAt: 0,
             completedAt: 0,
             nextReloadAt: 0,
+            waitingStartedAt: 0,
             cycleMode: "full",
             nextCycleMode: "yard",
             fullMaps: ["garbage", "garden"],
@@ -4523,6 +4525,7 @@
             fullThenYardMs: AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS,
             yardThenFullMs: AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS,
             idleMs: AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS,
+            startTimeoutMs: AVA_AUTO_CLEAN_LOOP_START_TIMEOUT_MS,
             startDelayMs: 3000,
             pollMs: 2000,
             _timers: [],
@@ -4543,6 +4546,7 @@
                 this.running = false;
                 this.phase = "off";
                 this.nextReloadAt = 0;
+                this.waitingStartedAt = 0;
                 try {
                     localStorage.setItem(storageKey, "0");
                 } catch {}
@@ -4577,6 +4581,11 @@
                     idleMs: this.idleMs,
                     fullThenYardMs: this.fullThenYardMs,
                     yardThenFullMs: this.yardThenFullMs,
+                    startTimeoutMs: this.startTimeoutMs,
+                    waitingStartedAt: this.waitingStartedAt,
+                    waitingForGameMs: this.waitingStartedAt
+                        ? Date.now() - this.waitingStartedAt
+                        : null,
                     startedAt: this.startedAt,
                     completedAt: this.completedAt,
                     nextReloadAt: this.nextReloadAt,
@@ -4637,6 +4646,44 @@
                 this.idleMs = this.fullThenYardMs;
             },
 
+            _markWaitingForGame() {
+                if (
+                    this.phase !== "waiting-for-game" ||
+                    !this.waitingStartedAt
+                ) {
+                    this.waitingStartedAt =
+                        Date.now();
+                }
+
+                this.phase = "waiting-for-game";
+            },
+
+            _maybeReloadStuckStartup() {
+                if (
+                    !this.enabled ||
+                    this.phase !== "waiting-for-game" ||
+                    !this.waitingStartedAt
+                ) {
+                    return false;
+                }
+
+                const elapsed =
+                    Date.now() -
+                    this.waitingStartedAt;
+
+                if (elapsed < this.startTimeoutMs) {
+                    return false;
+                }
+
+                this.phase = "startup-reloading";
+                console.warn(
+                    `[AVA AUTO LOOP] Game not playable after ${Math.round(elapsed / 1000)} seconds; reloading page`
+                );
+
+                this._setTimer(() => this._reload(), 1000);
+                return true;
+            },
+
             _startCycleWhenReady() {
                 this._clearTimers();
 
@@ -4645,7 +4692,7 @@
                 }
 
                 this._loadCycleMode();
-                this.phase = "waiting-for-game";
+                this._markWaitingForGame();
 
                 this._setTimer(() => {
                     if (!this.enabled) {
@@ -4653,18 +4700,27 @@
                     }
 
                     if (!w.__AVA_MAP_CLEANER__) {
-                        this._startCycleWhenReady();
+                        if (!this._maybeReloadStuckStartup()) {
+                            this._startCycleWhenReady();
+                        }
                         return;
                     }
 
                     if (!gameLooksPlayable()) {
-                        this.phase = "waiting-for-game";
+                        this._markWaitingForGame();
+
+                        if (this._maybeReloadStuckStartup()) {
+                            return;
+                        }
+
                         this._setTimer(
                             () => this._startCycleWhenReady(),
                             this.pollMs
                         );
                         return;
                     }
+
+                    this.waitingStartedAt = 0;
 
                     this._startCleaningCycle();
                 }, this.startDelayMs);
@@ -4687,6 +4743,7 @@
                 this.startedAt = Date.now();
                 this.completedAt = 0;
                 this.nextReloadAt = 0;
+                this.waitingStartedAt = 0;
 
                 console.log(
                     `[AVA AUTO LOOP] Cleaning ${this.maps.join(" then ")} (${this.cycleMode})`
