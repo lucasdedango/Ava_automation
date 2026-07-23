@@ -47,10 +47,12 @@
 __AVA_MAP_CLEANER__.resume();
 __AVA_MAP_CLEANER__.stop();</code></pre>
       <h3>Boucle automatique ON/OFF</h3>
-      <p>Le vrai réglage par défaut se trouve au début du userscript : <code>AVA_AUTO_CLEAN_LOOP_ON</code>. Mettez-le à <code>true</code> pour lancer automatiquement la boucle à chaque chargement, ou à <code>false</code> pour l'ignorer. La durée d'attente se règle au même endroit avec <code>AVA_AUTO_CLEAN_LOOP_IDLE_MS</code>.</p>
+      <p>Le vrai réglage par défaut se trouve au début du userscript : <code>AVA_AUTO_CLEAN_LOOP_ON</code>. Mettez-le à <code>true</code> pour lancer automatiquement la boucle à chaque chargement, ou à <code>false</code> pour l'ignorer. Les durées se règlent au même endroit avec <code>AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS</code> et <code>AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS</code>.</p>
       <pre><button class="copy">Copier</button><code>// Au début du userscript :
 const AVA_AUTO_CLEAN_LOOP_ON = true;
-const AVA_AUTO_CLEAN_LOOP_IDLE_MS = 70 * 60 * 1000;</code></pre>
+const AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS = 40 * 60 * 1000;
+const AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS = 30 * 60 * 1000;
+const AVA_BUTTERFLY_MAX_ATTEMPTS = 3;</code></pre>
       <pre><button class="copy">Copier</button><code>__AVA_AUTO_CLEAN_LOOP__.status();
 __AVA_AUTO_CLEAN_LOOP__.off();</code></pre>
       <h3>Déplacement manuel simple</h3>
@@ -204,11 +206,13 @@ candidates.filter(row =&gt; row.accepted).map(row =&gt; ({
 <pre><button class="copy">Copier</button><code>__AVA_MAP_CLEANER__.start({
     maps: ["garbage"]
 });</code></pre>
-      <h3>Boucle automatique yard → garden → idle → reload</h3>
-      <p><code>__AVA_AUTO_CLEAN_LOOP__</code> démarre automatiquement seulement si <code>AVA_AUTO_CLEAN_LOOP_ON</code> vaut <code>true</code> au début du userscript. Elle attend que le jeu soit jouable, nettoie <code>["garbage", "garden"]</code>, reste idle pendant <code>AVA_AUTO_CLEAN_LOOP_IDLE_MS</code>, puis recharge la page.</p>
+      <h3>Boucle automatique yard + garden / yard seul</h3>
+      <p><code>__AVA_AUTO_CLEAN_LOOP__</code> démarre automatiquement seulement si <code>AVA_AUTO_CLEAN_LOOP_ON</code> vaut <code>true</code> au début du userscript. Elle attend que le jeu soit jouable, nettoie d'abord <code>["garbage", "garden"]</code>, attend <code>AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS</code>, recharge pour nettoyer seulement <code>["garbage"]</code>, puis attend <code>AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS</code> avant de recommencer le cycle complet.</p>
       <pre><button class="copy">Copier</button><code>// Au début du userscript :
 const AVA_AUTO_CLEAN_LOOP_ON = true;
-const AVA_AUTO_CLEAN_LOOP_IDLE_MS = 70 * 60 * 1000;</code></pre>
+const AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS = 40 * 60 * 1000;
+const AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS = 30 * 60 * 1000;
+const AVA_BUTTERFLY_MAX_ATTEMPTS = 3;</code></pre>
       <pre><button class="copy">Copier</button><code>__AVA_AUTO_CLEAN_LOOP__.status();
 __AVA_AUTO_CLEAN_LOOP__.off();</code></pre>
 <pre><button class="copy">Copier</button><code>__AVA_MAP_CLEANER__.start({

@@ -28,7 +28,9 @@
      * so a refresh always follows the visible script configuration.
      */
     const AVA_AUTO_CLEAN_LOOP_ON = false;
-    const AVA_AUTO_CLEAN_LOOP_IDLE_MS = 70 * 60 * 1000;
+    const AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS = 40 * 60 * 1000;
+    const AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS = 30 * 60 * 1000;
+    const AVA_BUTTERFLY_MAX_ATTEMPTS = 3;
     const MIN_ENERGY_TO_ACT = 10;
 
     const AVA_STARTUP_WATCHDOG_ON = true;
@@ -2795,6 +2797,10 @@
                 mapLoadTimeout: 30000,
                 mapStableMs: 2500,
                 maxRetriesPerObject: 3,
+                butterflyMaxAttempts: AVA_BUTTERFLY_MAX_ATTEMPTS,
+                yardTimeoutMoveRetriesPerAttempt: 1,
+                yardSkippedReloads: 1,
+                yardTimeoutRetryDelayMs: 1000,
                 worldScanDepth: 5,
                 maxWorldScanObjects: 6000,
                 debugInteractionMethods: false,
@@ -2831,6 +2837,9 @@
             _activeAction: null,
             _activeManualPromise: null,
             _lastScanTargets: [],
+            _yardTimeoutRecoveryCounts: new Map(),
+            _yardSkippedReloadCount: 0,
+            _yardNeedsReloadForSkippedObjects: false,
 
             start(options = {}) {
                 if (this.running) {
@@ -2862,6 +2871,9 @@
                 this._debuggedInteractionMethods = new Set();
                 this._activeManualPromise = null;
                 this._lastScanTargets = [];
+                this._yardTimeoutRecoveryCounts = new Map();
+                this._yardSkippedReloadCount = 0;
+                this._yardNeedsReloadForSkippedObjects = false;
                 cleanerLog("Started");
                 this._moveToConfiguredMap();
                 return true;
@@ -3251,6 +3263,8 @@
                 this._debuggedInteractionMethods = new Set();
                 this._activeManualPromise = null;
                 this._lastScanTargets = [];
+                this._yardTimeoutRecoveryCounts = new Map();
+                this._yardNeedsReloadForSkippedObjects = false;
                 this._restoreWrappedTargets();
                 cleanerLog(`Moving to ${mapId}`);
                 if (typeof w.__AVA_GO_WORK__ === "function") {
@@ -3417,6 +3431,8 @@
 
                 const failedRound =
                     new Set();
+                const butterflyAttempts =
+                    new Map();
 
                 const captureNext = () => {
                     if (this._isEnergyPaused()) {
@@ -3477,9 +3493,42 @@
 
                     const targetId =
                         stableObjectId(target);
+                    const attempt =
+                        (butterflyAttempts.get(targetId) ?? 0) + 1;
+                    const maxAttempts =
+                        Math.max(
+                            1,
+                            Number(this.config.butterflyMaxAttempts ?? 3)
+                        );
+
+                    if (attempt > maxAttempts) {
+                        cleanerWarn(
+                            `Butterfly max attempts reached: ${targetId} (${maxAttempts})`
+                        );
+                        failedRound.add(targetId);
+
+                        if (remainingIds.every(id => failedRound.has(id))) {
+                            return Promise.reject(
+                                new Error("Butterfly max attempts reached")
+                            );
+                        }
+
+                        return new Promise((resolve, reject) => {
+                            this._setTimer(
+                                () => {
+                                    captureNext()
+                                        .then(resolve)
+                                        .catch(reject);
+                                },
+                                this.config.butterflySwitchDelayMs
+                            );
+                        });
+                    }
+
+                    butterflyAttempts.set(targetId, attempt);
 
                     cleanerLog(
-                        `Trying butterfly ${targetId} (${targetIds.length - remainingIds.length + 1}/${targetIds.length})`
+                        `Trying butterfly ${targetId} (${targetIds.length - remainingIds.length + 1}/${targetIds.length}, attempt ${attempt}/${maxAttempts})`
                     );
 
                     return this._captureButterflyTarget(target)
@@ -3835,6 +3884,26 @@
                     return;
                 }
                 const mapId = this.currentMap ?? this.config.maps[this._mapIndex];
+
+                if (
+                    mapId === "garbage" &&
+                    this._yardNeedsReloadForSkippedObjects &&
+                    this._yardSkippedReloadCount < this.config.yardSkippedReloads
+                ) {
+                    this._yardSkippedReloadCount++;
+                    this._yardNeedsReloadForSkippedObjects = false;
+                    this._skippedObjects = new Set();
+                    this._inactiveObjects = new Set();
+                    this._pendingObjects = new Map();
+                    this._attempts = new Map();
+                    this._yardTimeoutRecoveryCounts = new Map();
+                    cleanerWarn(
+                        `Reloading yard to retry skipped objects (${this._yardSkippedReloadCount}/${this.config.yardSkippedReloads})`
+                    );
+                    this._moveToConfiguredMap();
+                    return;
+                }
+
                 this.visitedMaps.push(mapId);
                 cleanerLog(`Map complete: ${mapId}`);
                 this._mapIndex++;
@@ -4152,6 +4221,105 @@
                 return true;
             },
 
+            _retryYardTargetAfterTimeout(token, target, startedAt) {
+                const targetId =
+                    stableObjectId(target);
+
+                if (
+                    this.currentMap !== "garbage" ||
+                    !targetId ||
+                    token !== this.interactionToken ||
+                    !this.busy
+                ) {
+                    return false;
+                }
+
+                const key =
+                    `${token}:${targetId}`;
+                const count =
+                    this._yardTimeoutRecoveryCounts.get(key) ?? 0;
+                const limit =
+                    Math.max(
+                        0,
+                        Number(this.config.yardTimeoutMoveRetriesPerAttempt ?? 1)
+                    );
+
+                if (count >= limit) {
+                    return false;
+                }
+
+                const avatar =
+                    w.__AVA_CURRENT_AVATAR__ ??
+                    null;
+                const InteractAction =
+                    getInteractActionClass();
+
+                if (
+                    !avatar ||
+                    typeof avatar.addAction !== "function" ||
+                    !InteractAction
+                ) {
+                    return false;
+                }
+
+                this._yardTimeoutRecoveryCounts.set(key, count + 1);
+                cleanerWarn(
+                    `Yard timeout recovery: moving to ${targetId} before retry (${count + 1}/${limit})`
+                );
+
+                const point =
+                    getTargetInteractionPoint(
+                        target,
+                        avatar
+                    );
+                const walkAction =
+                    point
+                        ? createWalkActionToPoint(
+                            avatar,
+                            point
+                        )
+                        : null;
+
+                if (walkAction) {
+                    this._activeAction = walkAction;
+                    avatar.addAction(walkAction);
+                }
+
+                this._setTimer(
+                    () => {
+                        if (
+                            token !== this.interactionToken ||
+                            !this.busy
+                        ) {
+                            return;
+                        }
+
+                        try {
+                            const action =
+                                new InteractAction(
+                                    target,
+                                    null
+                                );
+
+                            this._activeAction = action;
+                            avatar.addAction(action);
+                            this._watchInteraction(
+                                token,
+                                target,
+                                action,
+                                performance.now()
+                            );
+                        } catch (error) {
+                            cleanerWarn(`Yard timeout recovery failed: ${targetId}`, error);
+                            this._completeInteraction(token, "yard timeout recovery exception", false);
+                        }
+                    },
+                    this.config.yardTimeoutRetryDelayMs
+                );
+
+                return true;
+            },
+
             _watchInteraction(token, target, action, startedAt) {
                 const manual =
                     this._activeManualPromise?.token === token;
@@ -4210,6 +4378,10 @@
                             "butterfly timeout"
                         );
                         this._completeInteraction(token, "butterfly timeout", null);
+                        return;
+                    }
+
+                    if (this._retryYardTargetAfterTimeout(token, target, startedAt)) {
                         return;
                     }
 
@@ -4305,6 +4477,11 @@
                 this._skippedObjects.add(targetId);
                 this._pendingObjects.delete(targetId);
                 this.failedObjects++;
+
+                if (this.currentMap === "garbage") {
+                    this._yardNeedsReloadForSkippedObjects = true;
+                }
+
                 cleanerWarn(`Object skipped after ${this.config.maxRetriesPerObject} failures`, targetId);
             }
         };
@@ -4329,6 +4506,7 @@
 
     function initializeAutoCleanLoop() {
         const storageKey = "__AVA_AUTO_CLEAN_LOOP_ENABLED__";
+        const modeStorageKey = "__AVA_AUTO_CLEAN_LOOP_MODE__";
 
         const loop = {
             enabled: false,
@@ -4337,14 +4515,21 @@
             startedAt: 0,
             completedAt: 0,
             nextReloadAt: 0,
+            cycleMode: "full",
+            nextCycleMode: "yard",
+            fullMaps: ["garbage", "garden"],
+            yardMaps: ["garbage"],
             maps: ["garbage", "garden"],
-            idleMs: AVA_AUTO_CLEAN_LOOP_IDLE_MS,
+            fullThenYardMs: AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS,
+            yardThenFullMs: AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS,
+            idleMs: AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS,
             startDelayMs: 3000,
             pollMs: 2000,
             _timers: [],
 
             on() {
                 this.enabled = true;
+                this._loadCycleMode();
                 try {
                     localStorage.setItem(storageKey, "1");
                 } catch {}
@@ -4386,8 +4571,12 @@
                     enabled: this.enabled,
                     running: this.running,
                     phase: this.phase,
+                    cycleMode: this.cycleMode,
+                    nextCycleMode: this.nextCycleMode,
                     maps: this.maps.slice(),
                     idleMs: this.idleMs,
+                    fullThenYardMs: this.fullThenYardMs,
+                    yardThenFullMs: this.yardThenFullMs,
                     startedAt: this.startedAt,
                     completedAt: this.completedAt,
                     nextReloadAt: this.nextReloadAt,
@@ -4415,6 +4604,39 @@
                 this._timers.length = 0;
             },
 
+            _loadCycleMode() {
+                try {
+                    const stored =
+                        localStorage.getItem(modeStorageKey);
+
+                    if (stored === "yard" || stored === "full") {
+                        this.cycleMode = stored;
+                    }
+                } catch {}
+
+                this._refreshCycleConfig();
+            },
+
+            _storeCycleMode(mode) {
+                try {
+                    localStorage.setItem(modeStorageKey, mode);
+                } catch {}
+            },
+
+            _refreshCycleConfig() {
+                if (this.cycleMode === "yard") {
+                    this.maps = this.yardMaps.slice();
+                    this.nextCycleMode = "full";
+                    this.idleMs = this.yardThenFullMs;
+                    return;
+                }
+
+                this.cycleMode = "full";
+                this.maps = this.fullMaps.slice();
+                this.nextCycleMode = "yard";
+                this.idleMs = this.fullThenYardMs;
+            },
+
             _startCycleWhenReady() {
                 this._clearTimers();
 
@@ -4422,6 +4644,7 @@
                     return;
                 }
 
+                this._loadCycleMode();
                 this.phase = "waiting-for-game";
 
                 this._setTimer(() => {
@@ -4452,6 +4675,8 @@
                     return;
                 }
 
+                this._refreshCycleConfig();
+
                 if (w.__AVA_MAP_CLEANER__?.running) {
                     this._setTimer(() => this._watchCleaner(), this.pollMs);
                     return;
@@ -4463,7 +4688,9 @@
                 this.completedAt = 0;
                 this.nextReloadAt = 0;
 
-                console.log("[AVA AUTO LOOP] Cleaning yard then garden");
+                console.log(
+                    `[AVA AUTO LOOP] Cleaning ${this.maps.join(" then ")} (${this.cycleMode})`
+                );
 
                 try {
                     w.__AVA_MAP_CLEANER__.start({
@@ -4522,10 +4749,12 @@
                 this.running = false;
                 this.phase = "idle";
                 this.completedAt = Date.now();
+                this._refreshCycleConfig();
+                this._storeCycleMode(this.nextCycleMode);
                 this.nextReloadAt = this.completedAt + this.idleMs;
 
                 console.log(
-                    `[AVA AUTO LOOP] Idle for ${Math.round(this.idleMs / 60000)} minutes before reload`
+                    `[AVA AUTO LOOP] Idle for ${Math.round(this.idleMs / 60000)} minutes before reload; next cycle: ${this.nextCycleMode}`
                 );
 
                 this._setTimer(() => this._reload(), this.idleMs);
@@ -4544,6 +4773,7 @@
 
         loop.enabled =
             Boolean(AVA_AUTO_CLEAN_LOOP_ON);
+        loop._loadCycleMode();
 
         try {
             localStorage.setItem(
@@ -6262,7 +6492,15 @@
 
                 autoCleanLoopIdleMs:
                     w.__AVA_AUTO_CLEAN_LOOP__?.idleMs ??
-                    AVA_AUTO_CLEAN_LOOP_IDLE_MS,
+                    AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS,
+
+                autoCleanLoopCycleMode:
+                    w.__AVA_AUTO_CLEAN_LOOP__?.cycleMode ??
+                    null,
+
+                autoCleanLoopNextCycleMode:
+                    w.__AVA_AUTO_CLEAN_LOOP__?.nextCycleMode ??
+                    null,
 
                 autoCleanLoopPhase:
                     w.__AVA_AUTO_CLEAN_LOOP__?.phase ??
