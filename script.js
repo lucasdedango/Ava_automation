@@ -32,6 +32,7 @@
     const AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS = 30 * 60 * 1000;
     const AVA_AUTO_CLEAN_LOOP_START_TIMEOUT_MS = 60 * 1000;
     const AVA_BUTTERFLY_MAX_ATTEMPTS = 3;
+    const AVA_YARD_TIMEOUT_RETRY_DELAY_MS = 1000;
     const MIN_ENERGY_TO_ACT = 10;
 
     const AVA_STARTUP_WATCHDOG_ON = true;
@@ -2801,7 +2802,7 @@
                 butterflyMaxAttempts: AVA_BUTTERFLY_MAX_ATTEMPTS,
                 yardTimeoutMoveRetriesPerAttempt: 1,
                 yardSkippedReloads: 1,
-                yardTimeoutRetryDelayMs: 1000,
+                yardTimeoutRetryDelayMs: AVA_YARD_TIMEOUT_RETRY_DELAY_MS,
                 worldScanDepth: 5,
                 maxWorldScanObjects: 6000,
                 debugInteractionMethods: false,
@@ -4282,8 +4283,15 @@
                         : null;
 
                 if (walkAction) {
+                    cleanerLog(
+                        `Yard timeout recovery walk point: ${formatPoint(point)}`
+                    );
                     this._activeAction = walkAction;
                     avatar.addAction(walkAction);
+                } else {
+                    cleanerWarn(
+                        `Yard timeout recovery could not create WalkAction for ${targetId}; retrying InteractAction after delay`
+                    );
                 }
 
                 this._setTimer(
