@@ -47,14 +47,15 @@
 __AVA_MAP_CLEANER__.resume();
 __AVA_MAP_CLEANER__.stop();</code></pre>
       <h3>Boucle automatique ON/OFF</h3>
-      <p>Le vrai réglage par défaut se trouve au début du userscript : <code>AVA_AUTO_CLEAN_LOOP_ON</code>. Mettez-le à <code>true</code> pour lancer automatiquement la boucle à chaque chargement, ou à <code>false</code> pour l'ignorer. Les durées se règlent au même endroit avec <code>AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS</code>, <code>AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS</code>, <code>AVA_AUTO_CLEAN_LOOP_START_TIMEOUT_MS</code> pour recharger si le jeu ne devient pas jouable, et <code>AVA_YARD_TIMEOUT_RETRY_DELAY_MS</code> pour régler l’attente entre un timeout Yard, le déplacement de récupération et le nouvel essai.</p>
+      <p>Le vrai réglage par défaut se trouve au début du userscript : <code>AVA_AUTO_CLEAN_LOOP_ON</code>. Mettez-le à <code>true</code> pour lancer automatiquement la boucle à chaque chargement, ou à <code>false</code> pour l'ignorer. Les durées se règlent au même endroit avec <code>AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS</code>, <code>AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS</code>, <code>AVA_AUTO_CLEAN_LOOP_START_TIMEOUT_MS</code> pour recharger si le jeu ne devient pas jouable, <code>AVA_YARD_MAX_RETRIES_PER_OBJECT</code> pour le nombre d’essais Yard avant reload, et <code>AVA_YARD_INTERACTION_TIMEOUT_MS</code> pour le délai avant de considérer un ramassage Yard bloqué.</p>
       <pre><button class="copy">Copier</button><code>// Au début du userscript :
 const AVA_AUTO_CLEAN_LOOP_ON = true;
 const AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS = 40 * 60 * 1000;
 const AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS = 30 * 60 * 1000;
 const AVA_AUTO_CLEAN_LOOP_START_TIMEOUT_MS = 60 * 1000;
 const AVA_BUTTERFLY_MAX_ATTEMPTS = 3;
-const AVA_YARD_TIMEOUT_RETRY_DELAY_MS = 1000;</code></pre>
+const AVA_YARD_MAX_RETRIES_PER_OBJECT = 1;
+const AVA_YARD_INTERACTION_TIMEOUT_MS = 40000;</code></pre>
       <pre><button class="copy">Copier</button><code>__AVA_AUTO_CLEAN_LOOP__.status();
 __AVA_AUTO_CLEAN_LOOP__.off();</code></pre>
       <h3>Déplacement manuel simple</h3>
@@ -216,7 +217,8 @@ const AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS = 40 * 60 * 1000;
 const AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS = 30 * 60 * 1000;
 const AVA_AUTO_CLEAN_LOOP_START_TIMEOUT_MS = 60 * 1000;
 const AVA_BUTTERFLY_MAX_ATTEMPTS = 3;
-const AVA_YARD_TIMEOUT_RETRY_DELAY_MS = 1000;</code></pre>
+const AVA_YARD_MAX_RETRIES_PER_OBJECT = 1;
+const AVA_YARD_INTERACTION_TIMEOUT_MS = 40000;</code></pre>
       <pre><button class="copy">Copier</button><code>__AVA_AUTO_CLEAN_LOOP__.status();
 __AVA_AUTO_CLEAN_LOOP__.off();</code></pre>
 <pre><button class="copy">Copier</button><code>__AVA_MAP_CLEANER__.start({

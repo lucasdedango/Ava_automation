@@ -32,7 +32,8 @@
     const AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS = 30 * 60 * 1000;
     const AVA_AUTO_CLEAN_LOOP_START_TIMEOUT_MS = 60 * 1000;
     const AVA_BUTTERFLY_MAX_ATTEMPTS = 3;
-    const AVA_YARD_TIMEOUT_RETRY_DELAY_MS = 1000;
+    const AVA_YARD_MAX_RETRIES_PER_OBJECT = 1;
+    const AVA_YARD_INTERACTION_TIMEOUT_MS = 40000;
     const MIN_ENERGY_TO_ACT = 10;
 
     const AVA_STARTUP_WATCHDOG_ON = true;
@@ -1233,7 +1234,7 @@
             String(text ?? "")
                 .trim();
 
-        if (/^\d+\s*\/\s*\d+$/.test(value)) {
+        if (/^\d+\s*\/\s*100$/.test(value)) {
             return "fraction";
         }
 
@@ -1289,7 +1290,7 @@
         if (
             !Number.isFinite(current) ||
             !Number.isFinite(max) ||
-            max <= 0 ||
+            max !== 100 ||
             current < 0 ||
             current > max
         ) {
@@ -2800,9 +2801,9 @@
                 mapStableMs: 2500,
                 maxRetriesPerObject: 3,
                 butterflyMaxAttempts: AVA_BUTTERFLY_MAX_ATTEMPTS,
-                yardTimeoutMoveRetriesPerAttempt: 1,
+                yardMaxRetriesPerObject: AVA_YARD_MAX_RETRIES_PER_OBJECT,
+                yardInteractionTimeout: AVA_YARD_INTERACTION_TIMEOUT_MS,
                 yardSkippedReloads: 1,
-                yardTimeoutRetryDelayMs: AVA_YARD_TIMEOUT_RETRY_DELAY_MS,
                 worldScanDepth: 5,
                 maxWorldScanObjects: 6000,
                 debugInteractionMethods: false,
@@ -2839,7 +2840,6 @@
             _activeAction: null,
             _activeManualPromise: null,
             _lastScanTargets: [],
-            _yardTimeoutRecoveryCounts: new Map(),
             _yardSkippedReloadCount: 0,
             _yardNeedsReloadForSkippedObjects: false,
 
@@ -2873,7 +2873,6 @@
                 this._debuggedInteractionMethods = new Set();
                 this._activeManualPromise = null;
                 this._lastScanTargets = [];
-                this._yardTimeoutRecoveryCounts = new Map();
                 this._yardSkippedReloadCount = 0;
                 this._yardNeedsReloadForSkippedObjects = false;
                 cleanerLog("Started");
@@ -3265,7 +3264,6 @@
                 this._debuggedInteractionMethods = new Set();
                 this._activeManualPromise = null;
                 this._lastScanTargets = [];
-                this._yardTimeoutRecoveryCounts = new Map();
                 this._yardNeedsReloadForSkippedObjects = false;
                 this._restoreWrappedTargets();
                 cleanerLog(`Moving to ${mapId}`);
@@ -3898,7 +3896,6 @@
                     this._inactiveObjects = new Set();
                     this._pendingObjects = new Map();
                     this._attempts = new Map();
-                    this._yardTimeoutRecoveryCounts = new Map();
                     cleanerWarn(
                         `Reloading yard to retry skipped objects (${this._yardSkippedReloadCount}/${this.config.yardSkippedReloads})`
                     );
@@ -3931,9 +3928,39 @@
                     );
                 }
 
+                if (this.currentMap === "garbage") {
+                    return Math.max(
+                        1,
+                        Number(
+                            this.config.yardMaxRetriesPerObject ??
+                            this.config.maxRetriesPerObject
+                        )
+                    );
+                }
+
                 return Math.max(
                     1,
                     Number(this.config.maxRetriesPerObject ?? 3)
+                );
+            },
+
+            _getInteractionTimeoutForTarget(target) {
+                if (
+                    this.currentMap === "garbage" &&
+                    !isButterflyTarget(target)
+                ) {
+                    return Math.max(
+                        1000,
+                        Number(
+                            this.config.yardInteractionTimeout ??
+                            this.config.interactionTimeout
+                        )
+                    );
+                }
+
+                return Math.max(
+                    1000,
+                    Number(this.config.interactionTimeout ?? 40000)
                 );
             },
 
@@ -4252,112 +4279,6 @@
                 return true;
             },
 
-            _retryYardTargetAfterTimeout(token, target, startedAt) {
-                const targetId =
-                    stableObjectId(target);
-
-                if (
-                    this.currentMap !== "garbage" ||
-                    !targetId ||
-                    token !== this.interactionToken ||
-                    !this.busy
-                ) {
-                    return false;
-                }
-
-                const key =
-                    `${token}:${targetId}`;
-                const count =
-                    this._yardTimeoutRecoveryCounts.get(key) ?? 0;
-                const limit =
-                    Math.max(
-                        0,
-                        Number(this.config.yardTimeoutMoveRetriesPerAttempt ?? 1)
-                    );
-
-                if (count >= limit) {
-                    return false;
-                }
-
-                const avatar =
-                    w.__AVA_CURRENT_AVATAR__ ??
-                    null;
-                const InteractAction =
-                    getInteractActionClass();
-
-                if (
-                    !avatar ||
-                    typeof avatar.addAction !== "function" ||
-                    !InteractAction
-                ) {
-                    return false;
-                }
-
-                this._yardTimeoutRecoveryCounts.set(key, count + 1);
-                cleanerWarn(
-                    `Yard timeout recovery: moving to ${targetId} before retry (${count + 1}/${limit})`
-                );
-
-                const point =
-                    getTargetInteractionPoint(
-                        target,
-                        avatar
-                    );
-                const walkAction =
-                    point
-                        ? createWalkActionToPoint(
-                            avatar,
-                            point
-                        )
-                        : null;
-
-                if (walkAction) {
-                    cleanerLog(
-                        `Yard timeout recovery walk point: ${formatPoint(point)}`
-                    );
-                    this._activeAction = walkAction;
-                    avatar.addAction(walkAction);
-                } else {
-                    cleanerWarn(
-                        `Yard timeout recovery could not create WalkAction for ${targetId}; retrying InteractAction after delay`
-                    );
-                }
-
-                this._setTimer(
-                    () => {
-                        if (
-                            token !== this.interactionToken ||
-                            !this.busy
-                        ) {
-                            return;
-                        }
-
-                        try {
-                            const action =
-                                new InteractAction(
-                                    target,
-                                    null
-                                );
-
-                            this._activeAction = action;
-                            avatar.addAction(action);
-                            this._watchInteraction(
-                                token,
-                                target,
-                                action,
-                                performance.now()
-                            );
-                        } catch (error) {
-                            cleanerWarn(`Yard timeout recovery failed: ${targetId}`, error);
-                            this._completeInteraction(token, "yard timeout recovery exception", false);
-                        }
-                    },
-                    this.config.yardTimeoutRetryDelayMs
-                );
-
-                return true;
-            },
-
             _watchInteraction(token, target, action, startedAt) {
                 const manual =
                     this._activeManualPromise?.token === token;
@@ -4370,7 +4291,10 @@
                     this._completeInteraction(token, "detached");
                     return;
                 }
-                if (performance.now() - startedAt > this.config.interactionTimeout) {
+                if (
+                    performance.now() - startedAt >
+                    this._getInteractionTimeoutForTarget(target)
+                ) {
                     const butterflyTarget =
                         isButterflyTarget(target);
                     const targetAvailability = butterflyTarget
@@ -4416,10 +4340,6 @@
                             "butterfly timeout"
                         );
                         this._completeInteraction(token, "butterfly timeout", null);
-                        return;
-                    }
-
-                    if (this._retryYardTargetAfterTimeout(token, target, startedAt)) {
                         return;
                     }
 
@@ -4492,6 +4412,10 @@
                 this._inactiveObjects.add(targetId);
                 this._pendingObjects.delete(targetId);
                 this._skippedObjects.add(targetId);
+
+                if (this.currentMap === "garbage") {
+                    this._yardNeedsReloadForSkippedObjects = true;
+                }
 
                 cleanerLog(`Ignored inactive target ${targetId}`);
 
