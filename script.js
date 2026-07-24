@@ -3912,6 +3912,31 @@
                 this._moveToConfiguredMap();
             },
 
+            _getMaxAttemptsForTarget(target, targetId = null) {
+                const id =
+                    targetId == null
+                        ? ""
+                        : String(targetId);
+
+                if (
+                    isButterflyTarget(target) ||
+                    id.includes("|gdBtf")
+                ) {
+                    return Math.max(
+                        1,
+                        Number(
+                            this.config.butterflyMaxAttempts ??
+                            this.config.maxRetriesPerObject
+                        )
+                    );
+                }
+
+                return Math.max(
+                    1,
+                    Number(this.config.maxRetriesPerObject ?? 3)
+                );
+            },
+
             _startInteraction(target) {
                 if (this.busy) {
                     cleanerWarn("Interaction already running");
@@ -3932,7 +3957,8 @@
                         targetId,
                         butterflyTarget
                             ? "missing avatar"
-                            : "missing avatar or InteractAction"
+                            : "missing avatar or InteractAction",
+                        target
                     );
                     this._scheduleScan(this.config.scanDelay);
                     return false;
@@ -3943,7 +3969,7 @@
                     return false;
                 }
                 if (!isCleanableObject(target, this.config)) {
-                    this._registerFailure(targetId, "invalid target");
+                    this._registerFailure(targetId, "invalid target", target);
                     this._scheduleScan(this.config.scanDelay);
                     return false;
                 }
@@ -3977,13 +4003,16 @@
                 }
 
                 const attempt = (this._attempts.get(targetId) ?? 0) + 1;
+                const maxAttempts =
+                    this._getMaxAttemptsForTarget(target, targetId);
+
                 this._attempts.set(targetId, attempt);
                 this.totalAttempts++;
                 if (attempt > 1) {
-                    cleanerLog(`Retrying ${targetId}, attempt ${attempt}/${this.config.maxRetriesPerObject}`);
+                    cleanerLog(`Retrying ${targetId}, attempt ${attempt}/${maxAttempts}`);
                 }
-                if (attempt > this.config.maxRetriesPerObject) {
-                    this._skipObject(targetId);
+                if (attempt > maxAttempts) {
+                    this._skipObject(targetId, maxAttempts);
                     this._scheduleScan(this.config.scanDelay);
                     return false;
                 }
@@ -4420,7 +4449,7 @@
                     this.cleanedObjects++;
                     cleanerLog(`Completed ${targetId ?? "object"}`);
                 } else if (success === false && targetId) {
-                    this._registerFailure(targetId, reason);
+                    this._registerFailure(targetId, reason, target);
                 }
 
                 if (targetId) {
@@ -4471,15 +4500,18 @@
                 }
             },
 
-            _registerFailure(targetId, reason) {
+            _registerFailure(targetId, reason, target = null) {
                 const attempts = this._attempts.get(targetId) ?? 1;
+                const maxAttempts =
+                    this._getMaxAttemptsForTarget(target, targetId);
+
                 cleanerWarn(`${targetId} failed: ${reason}`);
-                if (attempts >= this.config.maxRetriesPerObject) {
-                    this._skipObject(targetId);
+                if (attempts >= maxAttempts) {
+                    this._skipObject(targetId, maxAttempts);
                 }
             },
 
-            _skipObject(targetId) {
+            _skipObject(targetId, maxAttempts = this.config.maxRetriesPerObject) {
                 if (this._skippedObjects.has(targetId)) {
                     return;
                 }
@@ -4491,7 +4523,7 @@
                     this._yardNeedsReloadForSkippedObjects = true;
                 }
 
-                cleanerWarn(`Object skipped after ${this.config.maxRetriesPerObject} failures`, targetId);
+                cleanerWarn(`Object skipped after ${maxAttempts} failures`, targetId);
             }
         };
 
