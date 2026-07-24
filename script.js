@@ -1158,6 +1158,7 @@
 
     let cachedEnergyRoots = [];
     let cachedEnergyField = null;
+    let cachedPickWorkScreen = null;
 
     function energyDebug(message, data = null) {
         if (data !== null) {
@@ -1832,6 +1833,109 @@
         } catch {
             return null;
         }
+    }
+
+    function getPickWorkScreenClass() {
+        try {
+            const PickWorkScreen =
+                w.penzville?.city?.work?.ui?.screen?.PickWorkScreen;
+
+            return typeof PickWorkScreen === "function"
+                ? PickWorkScreen
+                : null;
+        } catch {
+            return null;
+        }
+    }
+
+    function pickWorkScreenText(screen) {
+        try {
+            const field =
+                screen?.qde ??
+                null;
+
+            if (!field) {
+                return null;
+            }
+
+            return String(field.text ?? field.__text ?? "").trim();
+        } catch {
+            return null;
+        }
+    }
+
+    function pickWorkScreenLooksValid(screen) {
+        if (!screen || (typeof screen !== "object" && typeof screen !== "function")) {
+            return false;
+        }
+
+        const PickWorkScreen =
+            getPickWorkScreenClass();
+
+        try {
+            if (PickWorkScreen && screen instanceof PickWorkScreen) {
+                return Boolean(screen.qde);
+            }
+        } catch {}
+
+        return pickWorkScreenText(screen) !== null;
+    }
+
+    function resetPickWorkScreenCache() {
+        cachedPickWorkScreen = null;
+    }
+
+    function findPickWorkScreen() {
+        if (pickWorkScreenLooksValid(cachedPickWorkScreen)) {
+            return cachedPickWorkScreen;
+        }
+
+        cachedPickWorkScreen = null;
+
+        const roots =
+            energyRoots();
+        const stack =
+            roots.slice();
+        const seen =
+            new WeakSet();
+        const maxNodes =
+            10000;
+        let inspected =
+            0;
+
+        while (stack.length > 0 && inspected < maxNodes) {
+            const value =
+                stack.pop();
+
+            if (
+                !value ||
+                (typeof value !== "object" && typeof value !== "function") ||
+                seen.has(value)
+            ) {
+                continue;
+            }
+
+            seen.add(value);
+            inspected++;
+
+            if (pickWorkScreenLooksValid(value)) {
+                cachedPickWorkScreen = value;
+                return value;
+            }
+
+            pushDisplayChildren(stack, value);
+        }
+
+        return null;
+    }
+
+    function isCurrentWorkFinished() {
+        const screen =
+            findPickWorkScreen();
+        const text =
+            pickWorkScreenText(screen);
+
+        return text === "All work here is finished";
     }
 
     function gameLooksPlayable() {
@@ -2799,6 +2903,8 @@
                 emptyScanInterval: 1000,
                 mapLoadTimeout: 30000,
                 mapStableMs: 2500,
+                pickWorkScreenTimeout: 5000,
+                pickWorkScreenPollMs: 250,
                 maxRetriesPerObject: 3,
                 butterflyMaxAttempts: AVA_BUTTERFLY_MAX_ATTEMPTS,
                 yardMaxRetriesPerObject: AVA_YARD_MAX_RETRIES_PER_OBJECT,
@@ -3266,6 +3372,7 @@
                 this._lastScanTargets = [];
                 this._yardNeedsReloadForSkippedObjects = false;
                 this._restoreWrappedTargets();
+                resetPickWorkScreenCache();
                 cleanerLog(`Moving to ${mapId}`);
                 if (typeof w.__AVA_GO_WORK__ === "function") {
                     w.__AVA_GO_WORK__(mapId);
@@ -3289,7 +3396,7 @@
                         const stableAvatar = w.__AVA_CURRENT_AVATAR__ ?? null;
                         if (this.running && stableAvatar && (stableTargets.length > 0 || stableAvatar !== previousAvatar)) {
                             cleanerLog(`Map loaded: ${mapId}`);
-                            this._scheduleScan(0);
+                            this._waitForWorkFinishedOrScan(mapId, performance.now());
                         } else {
                             this._waitForMapLoad(mapId, previousAvatar, startedAt);
                         }
@@ -3298,10 +3405,56 @@
                 }
                 if (performance.now() - startedAt > this.config.mapLoadTimeout) {
                     cleanerWarn(`Map load timeout: ${mapId}`);
-                    this._scheduleScan(0);
+                    this._waitForWorkFinishedOrScan(mapId, performance.now());
                     return;
                 }
                 this._setTimer(() => this._waitForMapLoad(mapId, previousAvatar, startedAt), 500);
+            },
+
+            _skipCurrentWorkArea(mapId, reason) {
+                this.busy = false;
+                this.currentTarget = null;
+                this._emptyScans = 0;
+                this.visitedMaps.push(mapId);
+                cleanerLog(reason || `[WORK] Zone already completed, skipping: ${mapId}`);
+                this._mapIndex++;
+                this._moveToConfiguredMap();
+            },
+
+            _waitForWorkFinishedOrScan(mapId, startedAt) {
+                if (!this.running) {
+                    return;
+                }
+
+                const screen =
+                    findPickWorkScreen();
+
+                if (screen) {
+                    if (isCurrentWorkFinished()) {
+                        this._skipCurrentWorkArea(
+                            mapId,
+                            `[WORK] Zone already completed, skipping: ${mapId}`
+                        );
+                        return;
+                    }
+
+                    this._scheduleScan(0);
+                    return;
+                }
+
+                if (
+                    performance.now() - startedAt >=
+                    this.config.pickWorkScreenTimeout
+                ) {
+                    cleanerLog("[WORK] PickWorkScreen not found; continuing normal scan");
+                    this._scheduleScan(0);
+                    return;
+                }
+
+                this._setTimer(
+                    () => this._waitForWorkFinishedOrScan(mapId, startedAt),
+                    this.config.pickWorkScreenPollMs
+                );
             },
 
             _scheduleScan(delay = this.config.scanDelay) {
@@ -6333,6 +6486,9 @@
      * AIDE
      * ============================================================
      */
+
+    w.__AVA_IS_WORK_FINISHED__ =
+        isCurrentWorkFinished;
 
     w.__AVA_HELP__ = function () {
         const commands = [
