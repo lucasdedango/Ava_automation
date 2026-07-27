@@ -4,7 +4,6 @@
 // @version      12.0
 // @description  Inspection réseau, WalkAction et événements UI filtrés
 // @match        https://vk.ru/*
-// @match        https://vk.com/*
 // @match        https://cdn-sp.tortugasocial.com/avataria-vk/app/index_js.html*
 // @run-at       document-start
 // @grant        unsafeWindow
@@ -332,7 +331,7 @@
     function parentVkOrigin() {
         try {
             const origin = new URL(document.referrer).origin;
-            return origin === "https://vk.ru" || origin === "https://vk.com"
+            return origin === "https://vk.ru"
                 ? origin
                 : null;
         } catch {
@@ -344,7 +343,7 @@
         const detectedOrigin = parentVkOrigin();
         const targetOrigins = detectedOrigin
             ? [detectedOrigin]
-            : ["https://vk.ru", "https://vk.com"];
+            : ["https://vk.ru"];
         const send = () => {
             try {
                 const payload = {
@@ -3215,11 +3214,13 @@
                 mapStableMs: 2500,
                 pickWorkScreenTimeout: 5000,
                 pickWorkScreenPollMs: 250,
+                pickWorkScreenTextStableMs: 750,
                 maxRetriesPerObject: 3,
                 butterflyMaxAttempts: AVA_BUTTERFLY_MAX_ATTEMPTS,
                 yardMaxRetriesPerObject: AVA_YARD_MAX_RETRIES_PER_OBJECT,
                 yardInteractionTimeout: AVA_YARD_INTERACTION_TIMEOUT_MS,
                 yardSkippedReloads: 1,
+                workAreaSkippedReloads: 1,
                 worldScanDepth: 5,
                 maxWorldScanObjects: 6000,
                 debugInteractionMethods: false,
@@ -3258,6 +3259,8 @@
             _lastScanTargets: [],
             _yardSkippedReloadCount: 0,
             _yardNeedsReloadForSkippedObjects: false,
+            _workAreaReloadCounts: new Map(),
+            _workAreaNeedsReloadForSkippedObjects: false,
             _recoveryTargetId: null,
             _restoredRecoveryState: null,
 
@@ -3293,6 +3296,8 @@
                 this._lastScanTargets = [];
                 this._yardSkippedReloadCount = 0;
                 this._yardNeedsReloadForSkippedObjects = false;
+                this._workAreaReloadCounts = new Map();
+                this._workAreaNeedsReloadForSkippedObjects = false;
                 cleanerLog("Started");
                 requestRecoveryCheckpointSave("cleaner-start", true);
                 this._moveToConfiguredMap();
@@ -3728,6 +3733,7 @@
                 this._activeManualPromise = null;
                 this._lastScanTargets = [];
                 this._yardNeedsReloadForSkippedObjects = false;
+                this._workAreaNeedsReloadForSkippedObjects = false;
                 if (this._restoredRecoveryState) {
                     this._completedObjects = this._restoredRecoveryState.completed;
                     this._skippedObjects = this._restoredRecoveryState.skipped;
@@ -3777,6 +3783,14 @@
             },
 
             _skipCurrentWorkArea(mapId, reason) {
+                const activeTarget = this.currentTarget;
+                this.interactionToken++;
+                this._clearTimers();
+                if (activeTarget) {
+                    restoreFinishInteractionWatch(activeTarget);
+                }
+                this._activeAction = null;
+                this._rejectManualInteraction("work area already finished");
                 this.busy = false;
                 this.currentTarget = null;
                 this._emptyScans = 0;
@@ -3786,7 +3800,21 @@
                 this._moveToConfiguredMap();
             },
 
-            _waitForWorkFinishedOrScan(mapId, startedAt) {
+            _continueAfterWorkScreenTimeout(message) {
+                cleanerLog(message);
+                if (crashRecoveryState.recoveryInProgress) {
+                    cleanerLog("[AVA RECOVERY] Work screen timeout; rescanning interrupted zone");
+                    finishCrashRecovery();
+                }
+                this._scheduleScan(0);
+            },
+
+            _waitForWorkFinishedOrScan(
+                mapId,
+                startedAt,
+                observedText = null,
+                textChangedAt = startedAt
+            ) {
                 if (!this.running) {
                     return;
                 }
@@ -3795,7 +3823,43 @@
                     findPickWorkScreen();
 
                 if (screen) {
-                    if (isCurrentWorkFinished()) {
+                    const text =
+                        pickWorkScreenText(screen) ?? "";
+                    const now =
+                        performance.now();
+
+                    if (!text || text !== observedText) {
+                        this._setTimer(
+                            () => this._waitForWorkFinishedOrScan(
+                                mapId,
+                                startedAt,
+                                text,
+                                now
+                            ),
+                            this.config.pickWorkScreenPollMs
+                        );
+                        return;
+                    }
+
+                    if (
+                        now - textChangedAt <
+                        this.config.pickWorkScreenTextStableMs
+                    ) {
+                        this._setTimer(
+                            () => this._waitForWorkFinishedOrScan(
+                                mapId,
+                                startedAt,
+                                text,
+                                textChangedAt
+                            ),
+                            this.config.pickWorkScreenPollMs
+                        );
+                        return;
+                    }
+
+                    cleanerLog(`[WORK] PickWorkScreen ready: ${text}`);
+
+                    if (text === "All work here is finished") {
                         if (crashRecoveryState.recoveryInProgress) {
                             cleanerLog(`[AVA RECOVERY] Recovered zone ${mapId} is already finished; skipping`);
                             finishCrashRecovery();
@@ -3820,17 +3884,19 @@
                     performance.now() - startedAt >=
                     this.config.pickWorkScreenTimeout
                 ) {
-                    cleanerLog("[WORK] PickWorkScreen not found; continuing normal scan");
-                    if (crashRecoveryState.recoveryInProgress) {
-                        cleanerLog("[AVA RECOVERY] Work screen timeout; rescanning interrupted zone");
-                        finishCrashRecovery();
-                    }
-                    this._scheduleScan(0);
+                    this._continueAfterWorkScreenTimeout(
+                        "[WORK] PickWorkScreen not found; continuing normal scan"
+                    );
                     return;
                 }
 
                 this._setTimer(
-                    () => this._waitForWorkFinishedOrScan(mapId, startedAt),
+                    () => this._waitForWorkFinishedOrScan(
+                        mapId,
+                        startedAt,
+                        observedText,
+                        textChangedAt
+                    ),
                     this.config.pickWorkScreenPollMs
                 );
             },
@@ -3840,6 +3906,23 @@
                     return;
                 }
                 this._setTimer(() => this._scanAndRun(), delay);
+            },
+
+            _skipIfCurrentWorkFinished(source) {
+                if (!isCurrentWorkFinished()) {
+                    return false;
+                }
+                const mapId =
+                    this.currentMap ??
+                    this.config.maps[this._mapIndex];
+                cleanerLog(
+                    `[WORK] ${mapId} finished during ${source}; cancelling active target`
+                );
+                this._skipCurrentWorkArea(
+                    mapId,
+                    `[WORK] Zone already completed, skipping: ${mapId}`
+                );
+                return true;
             },
 
             _rankAvailableTargets(targets) {
@@ -4233,6 +4316,9 @@
                 if (!this.running || this.paused) {
                     return;
                 }
+                if (this._skipIfCurrentWorkFinished("scan")) {
+                    return;
+                }
                 if (this.busy) {
                     cleanerWarn("Interaction already running");
                     return;
@@ -4437,19 +4523,33 @@
                 }
                 const mapId = this.currentMap ?? this.config.maps[this._mapIndex];
 
+                const reloadCount =
+                    this._workAreaReloadCounts.get(mapId) ?? 0;
+                const maxReloads = Math.max(
+                    0,
+                    Number(
+                        this.config.workAreaSkippedReloads ??
+                        this.config.yardSkippedReloads ??
+                        0
+                    )
+                );
+
                 if (
-                    mapId === "garbage" &&
-                    this._yardNeedsReloadForSkippedObjects &&
-                    this._yardSkippedReloadCount < this.config.yardSkippedReloads
+                    !isCurrentWorkFinished() &&
+                    this._workAreaNeedsReloadForSkippedObjects &&
+                    reloadCount < maxReloads
                 ) {
-                    this._yardSkippedReloadCount++;
+                    const nextReloadCount = reloadCount + 1;
+                    this._workAreaReloadCounts.set(mapId, nextReloadCount);
+                    this._yardSkippedReloadCount = nextReloadCount;
                     this._yardNeedsReloadForSkippedObjects = false;
+                    this._workAreaNeedsReloadForSkippedObjects = false;
                     this._skippedObjects = new Set();
                     this._inactiveObjects = new Set();
                     this._pendingObjects = new Map();
                     this._attempts = new Map();
                     cleanerWarn(
-                        `Reloading yard to retry skipped objects (${this._yardSkippedReloadCount}/${this.config.yardSkippedReloads})`
+                        `Reloading ${mapId} to retry skipped objects (${nextReloadCount}/${maxReloads})`
                     );
                     this._moveToConfiguredMap();
                     return;
@@ -4519,6 +4619,9 @@
             _startInteraction(target) {
                 if (this.busy) {
                     cleanerWarn("Interaction already running");
+                    return false;
+                }
+                if (this._skipIfCurrentWorkFinished("interaction start")) {
                     return false;
                 }
                 const avatar = w.__AVA_CURRENT_AVATAR__ ?? null;
@@ -4605,6 +4708,10 @@
                     }
 
                     return started;
+                }
+
+                if (this._skipIfCurrentWorkFinished("InteractAction creation")) {
+                    return false;
                 }
 
                 this.busy = true;
@@ -4790,6 +4897,9 @@
                             typeof target.readyInteract === "function" &&
                             target.readyInteract() === true
                         ) {
+                            if (this._skipIfCurrentWorkFinished("butterfly InteractAction creation")) {
+                                return;
+                            }
                             if (!this._canStartEnergyAction()) {
                                 this._completeInteraction(token, "energy paused", null);
                                 return;
@@ -4838,6 +4948,9 @@
                     this._activeManualPromise?.token === token;
 
                 if ((!this.running && !manual) || token !== this.interactionToken || !this.busy) {
+                    return;
+                }
+                if (this._skipIfCurrentWorkFinished("active interaction")) {
                     return;
                 }
                 const targetId = stableObjectId(target);
@@ -4974,6 +5087,7 @@
                 if (this.currentMap === "garbage") {
                     this._yardNeedsReloadForSkippedObjects = true;
                 }
+                this._workAreaNeedsReloadForSkippedObjects = true;
 
                 cleanerLog(`Ignored inactive target ${targetId}`);
 
@@ -5006,6 +5120,7 @@
                 if (this.currentMap === "garbage") {
                     this._yardNeedsReloadForSkippedObjects = true;
                 }
+                this._workAreaNeedsReloadForSkippedObjects = true;
 
                 cleanerWarn(`Object skipped after ${maxAttempts} failures`, targetId);
                 requestRecoveryCheckpointSave("target-skipped", true);

@@ -5,6 +5,11 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync('script.js', 'utf8');
 
+test('userscript parent match is limited to vk.ru', () => {
+    assert.match(source, /\/\/ @match\s+https:\/\/vk\.ru\/\*/);
+    assert.doesNotMatch(source, /\/\/ @match\s+https:\/\/vk\.com\/\*/);
+});
+
 function loadParentContext() {
     const messageListeners = [];
     const intervals = [];

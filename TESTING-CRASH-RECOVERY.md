@@ -2,7 +2,7 @@
 
 These checks require the live VK application and cannot be reproduced by the local Node.js tests.
 
-1. Enable `AVA_AUTO_CLEAN_LOOP_ON`, open the game from `vk.ru` or `vk.com`, and verify `__AVA_CRASH_WATCHDOG_STATUS__()` in the top-page console reports `armed: true` after the first heartbeat.
+1. Enable `AVA_AUTO_CLEAN_LOOP_ON`, open the game from `vk.ru`, and verify `__AVA_CRASH_WATCHDOG_STATUS__()` in the top-page console reports `armed: true` after the first heartbeat.
 2. In the game iframe console, verify `__AVA_RECOVERY_STATUS__()` reports `recoveryInProgress: false` during a normal run.
 3. Start a full cycle and interrupt the game iframe while cleaning `garbage`. Confirm the top-page watchdog logs two heartbeat timeouts, saves a checkpoint, and reloads VK.
 4. After reload, confirm the cleaner teleports back to `garbage`, rescans the current server state, prioritizes the interrupted stable target when it still exists, and otherwise continues without recording a failure.
