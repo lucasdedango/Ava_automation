@@ -11,12 +11,17 @@ test('userscript parent match is limited to vk.ru', () => {
 });
 
 test('work completion detection scans the OpenFL stage without PickWorkScreen', () => {
-    const implementation = source.match(
-        /function isCurrentWorkFinished\(\) \{[\s\S]*?\n    \}\r?\n\r?\n    function gameLooksPlayable/
+    const traversal = source.match(
+        /function findVisibleFinishedWorkText\(options = \{\}\) \{[\s\S]*?\n    \}\r?\n\r?\n    function isCurrentWorkFinished/
     )?.[0] ?? '';
-    assert.match(implementation, /w\.openfl\?\.Lib\?\.current\?\.stage/);
-    assert.match(implementation, /\["text", "__text", "htmlText"\]/);
-    assert.doesNotMatch(implementation, /findPickWorkScreen/);
+    const waitGate = source.match(
+        /_waitForWorkFinishedOrScan\(mapId\) \{[\s\S]*?\n            \},\r?\n\r?\n            _scheduleScan/
+    )?.[0] ?? '';
+    assert.match(source, /w\.openfl\?\.Lib\?\.current\?\.stage/);
+    assert.match(source, /Context\?\.J\?\.Ele\?\.Ey/);
+    assert.match(traversal, /\["text", "__text", "htmlText"\]/);
+    assert.match(traversal, /visitedNodes/);
+    assert.doesNotMatch(waitGate, /findPickWorkScreen/);
 });
 
 function loadParentContext() {

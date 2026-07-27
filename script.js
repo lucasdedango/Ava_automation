@@ -2247,39 +2247,73 @@
         return null;
     }
 
-    function isCurrentWorkFinished() {
-        const expectedText =
-            "All work here is finished";
-        let stage = null;
+    function normalizeWorkDisplayText(value) {
+        try {
+            return String(value ?? "")
+                .replace(/<[^>]*>/g, " ")
+                .replace(/&nbsp;/gi, " ")
+                .replace(/[\u00a0\u200b-\u200d\ufeff]/g, " ")
+                .replace(/\s+/g, " ")
+                .trim();
+        } catch {
+            return "";
+        }
+    }
+
+    function workDisplayRoots() {
+        const roots = [];
 
         try {
-            stage =
-                w.openfl?.Lib?.current?.stage ??
-                null;
-        } catch {
-            stage = null;
-        }
+            roots.push({
+                name: "openfl.Lib.current.stage",
+                object: w.openfl?.Lib?.current?.stage ?? null
+            });
+            roots.push({
+                name: "Context.J.Ele.Ey",
+                object: w.penzville?.city?.Context?.J?.Ele?.Ey ?? null
+            });
+        } catch {}
 
-        if (!stage) {
-            return false;
-        }
+        const seen = new WeakSet();
+        return roots.filter(entry => {
+            const object = entry.object;
+            if (
+                !object ||
+                (typeof object !== "object" && typeof object !== "function") ||
+                seen.has(object)
+            ) {
+                return false;
+            }
+            seen.add(object);
+            return true;
+        });
+    }
 
-        const stack = [{
-            object: stage,
+    /*
+     * Garden and Yard do not expose the completion message through the
+     * same PickWorkScreen hierarchy. Walk the actual OpenFL display roots
+     * instead, preserving paths so the runtime traversal can be compared
+     * directly with console diagnostics after client updates.
+     */
+    function findVisibleFinishedWorkText(options = {}) {
+        const expectedText = "All work here is finished";
+        const debug = options.debug === true;
+        const roots = workDisplayRoots();
+        const stack = roots.map(entry => ({
+            object: entry.object,
+            path: entry.name,
             visible: true
-        }];
-        const visited =
-            new WeakSet();
-        const maxNodes =
-            10000;
-        let inspected =
-            0;
+        }));
+        const visited = new WeakSet();
+        const matches = [];
+        const maxNodes = 10000;
+        let visitedNodes = 0;
+        let hiddenBranches = 0;
+        let found = null;
 
-        while (stack.length > 0 && inspected < maxNodes) {
-            const entry =
-                stack.pop();
-            const object =
-                entry.object;
+        while (stack.length > 0 && visitedNodes < maxNodes) {
+            const entry = stack.pop();
+            const object = entry.object;
 
             if (
                 !object ||
@@ -2290,11 +2324,9 @@
             }
 
             visited.add(object);
-            inspected++;
+            visitedNodes++;
 
-            let visible =
-                entry.visible;
-
+            let visible = entry.visible;
             try {
                 if (object.visible === false || Number(object.alpha) === 0) {
                     visible = false;
@@ -2302,40 +2334,45 @@
             } catch {}
 
             if (!visible) {
-                continue;
+                hiddenBranches++;
             }
 
             for (const property of ["text", "__text", "htmlText"]) {
-                let value = "";
-
+                let text = "";
                 try {
-                    value = String(object[property] ?? "")
-                        .replace(/<[^>]*>/g, " ")
-                        .replace(/&nbsp;/gi, " ")
-                        .replace(/\s+/g, " ")
-                        .trim();
-                } catch {
-                    value = "";
+                    text = normalizeWorkDisplayText(object[property]);
+                } catch {}
+
+                if (!text) {
+                    continue;
                 }
 
-                if (value.includes(expectedText)) {
-                    return true;
+                const relevant =
+                    text.includes(expectedText) ||
+                    /\b(work|finished)\b/i.test(text);
+
+                if (relevant) {
+                    const match = {
+                        path: entry.path,
+                        property,
+                        text,
+                        visible,
+                        object
+                    };
+                    matches.push(match);
+
+                    if (visible && text.includes(expectedText) && !found) {
+                        found = match;
+                    }
                 }
             }
 
             let children = null;
-
             try {
-                children =
-                    object.__children ??
-                    object.children ??
-                    null;
-            } catch {
-                children = null;
-            }
+                children = object.__children ?? object.children ?? null;
+            } catch {}
 
             let childCount = 0;
-
             try {
                 childCount = children && typeof children.length === "number"
                     ? children.length
@@ -2344,9 +2381,7 @@
                             ? Number(object.numChildren ?? 0)
                             : 0
                     );
-            } catch {
-                childCount = 0;
-            }
+            } catch {}
 
             if (!Number.isFinite(childCount) || childCount <= 0) {
                 continue;
@@ -2357,10 +2392,10 @@
                     const child = children && typeof children.length === "number"
                         ? children[index]
                         : object.getChildAt(index);
-
                     if (child) {
                         stack.push({
                             object: child,
+                            path: `${entry.path}.children[${index}]`,
                             visible
                         });
                     }
@@ -2368,7 +2403,41 @@
             }
         }
 
-        return false;
+        const result = {
+            found: Boolean(found),
+            visitedNodes,
+            hiddenBranches,
+            rootNames: roots.map(entry => entry.name),
+            match: found,
+            matches
+        };
+
+        if (debug) {
+            console.log(
+                `[WORK DEBUG] findVisibleFinishedWorkText() => ${result.found ? "found" : "not found"}; ` +
+                `${visitedNodes} nodes visited; ${hiddenBranches} hidden branches`
+            );
+            console.table(matches.map(match => ({
+                path: match.path,
+                property: match.property,
+                text: match.text,
+                visible: match.visible
+            })));
+        }
+
+        return result;
+    }
+
+    function isCurrentWorkFinished() {
+        const result = findVisibleFinishedWorkText();
+        if (result.found) {
+            cleanerLog("[WORK] Finished text found in display tree", {
+                path: result.match?.path ?? null,
+                property: result.match?.property ?? null,
+                visitedNodes: result.visitedNodes
+            });
+        }
+        return result.found;
     }
 
     function gameLooksPlayable() {
@@ -3824,21 +3893,7 @@
                 this._moveToConfiguredMap();
             },
 
-            _continueAfterWorkScreenTimeout(message) {
-                cleanerLog(message);
-                if (crashRecoveryState.recoveryInProgress) {
-                    cleanerLog("[AVA RECOVERY] Work screen timeout; rescanning interrupted zone");
-                    finishCrashRecovery();
-                }
-                this._scheduleScan(0);
-            },
-
-            _waitForWorkFinishedOrScan(
-                mapId,
-                startedAt,
-                observedText = null,
-                textChangedAt = startedAt
-            ) {
+            _waitForWorkFinishedOrScan(mapId) {
                 if (!this.running) {
                     return;
                 }
@@ -3855,74 +3910,12 @@
                     return;
                 }
 
-                const screen =
-                    findPickWorkScreen();
-
-                if (screen) {
-                    const text =
-                        pickWorkScreenText(screen) ?? "";
-                    const now =
-                        performance.now();
-
-                    if (!text || text !== observedText) {
-                        this._setTimer(
-                            () => this._waitForWorkFinishedOrScan(
-                                mapId,
-                                startedAt,
-                                text,
-                                now
-                            ),
-                            this.config.pickWorkScreenPollMs
-                        );
-                        return;
-                    }
-
-                    if (
-                        now - textChangedAt <
-                        this.config.pickWorkScreenTextStableMs
-                    ) {
-                        this._setTimer(
-                            () => this._waitForWorkFinishedOrScan(
-                                mapId,
-                                startedAt,
-                                text,
-                                textChangedAt
-                            ),
-                            this.config.pickWorkScreenPollMs
-                        );
-                        return;
-                    }
-
-                    cleanerLog(`[WORK] PickWorkScreen ready: ${text}`);
-
-                    if (crashRecoveryState.recoveryInProgress) {
-                        cleanerLog("[AVA RECOVERY] Work screen loaded");
-                        cleanerLog("[AVA RECOVERY] Rescanning interrupted zone");
-                        finishCrashRecovery();
-                    }
-                    this._scheduleScan(0);
-                    return;
+                if (crashRecoveryState.recoveryInProgress) {
+                    cleanerLog("[AVA RECOVERY] Rescanning interrupted zone");
+                    finishCrashRecovery();
                 }
 
-                if (
-                    performance.now() - startedAt >=
-                    this.config.pickWorkScreenTimeout
-                ) {
-                    this._continueAfterWorkScreenTimeout(
-                        "[WORK] PickWorkScreen not found; continuing normal scan"
-                    );
-                    return;
-                }
-
-                this._setTimer(
-                    () => this._waitForWorkFinishedOrScan(
-                        mapId,
-                        startedAt,
-                        observedText,
-                        textChangedAt
-                    ),
-                    this.config.pickWorkScreenPollMs
-                );
+                this._scheduleScan(0);
             },
 
             _scheduleScan(delay = this.config.scanDelay) {
@@ -7112,6 +7105,10 @@
     w.__AVA_IS_WORK_FINISHED__ =
         isCurrentWorkFinished;
 
+    w.__AVA_DEBUG_WORK_FINISHED__ = function () {
+        return findVisibleFinishedWorkText({ debug: true });
+    };
+
     w.__AVA_HELP__ = function () {
         const commands = [
             {
@@ -7156,7 +7153,7 @@
             },
             {
                 section: "Crash recovery",
-                commands: "__AVA_RECOVERY_STATUS__(), __AVA_IS_WORK_FINISHED__()"
+                commands: "__AVA_RECOVERY_STATUS__(), __AVA_IS_WORK_FINISHED__(), __AVA_DEBUG_WORK_FINISHED__()"
             },
             {
                 section: "Status",
