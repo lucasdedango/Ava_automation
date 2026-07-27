@@ -3,11 +3,16 @@
 // @namespace    local-debug
 // @version      12.0
 // @description  Inspection réseau, WalkAction et événements UI filtrés
+// @match        https://vk.ru/*
+// @match        https://vk.com/*
 // @match        https://cdn-sp.tortugasocial.com/avataria-vk/app/index_js.html*
 // @run-at       document-start
 // @grant        unsafeWindow
 // @grant        GM_setClipboard
 // @grant        GM_registerMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
 // ==/UserScript==
 
 (function () {
@@ -17,6 +22,202 @@
      * La capture des fonctions métier utilise encore
      * Function.caller et Function.arguments.
      */
+
+    const HEARTBEAT_INTERVAL_MS = 3000;
+    const HEARTBEAT_TIMEOUT_MS = 15000;
+    const HEARTBEAT_WATCHDOG_CHECK_MS = 3000;
+    const HEARTBEAT_REQUIRED_TIMEOUT_CHECKS = 2;
+    const RECOVERY_STORAGE_KEY = "__AVA_CRASH_RECOVERY_V1__";
+    const RECOVERY_RELOAD_HISTORY_KEY = "__AVA_CRASH_RELOAD_HISTORY_V1__";
+    const RECOVERY_SCHEMA_VERSION = 1;
+    const RECOVERY_TTL_MS = 10 * 60 * 1000;
+    const RECOVERY_MAX_RELOADS = 3;
+    const RECOVERY_RELOAD_WINDOW_MS = 10 * 60 * 1000;
+
+    function gmRead(key, fallback = null) {
+        try {
+            return Promise.resolve(GM_getValue(key, fallback));
+        } catch {
+            return Promise.resolve(fallback);
+        }
+    }
+
+    function gmWrite(key, value) {
+        try {
+            return Promise.resolve(GM_setValue(key, value)).then(() => true, () => false);
+        } catch {
+            return Promise.resolve(false);
+        }
+    }
+
+    function gmDelete(key) {
+        try {
+            return Promise.resolve(GM_deleteValue(key)).then(() => true, () => false);
+        } catch {
+            return Promise.resolve(false);
+        }
+    }
+
+    function validHeartbeatEvent(event, gameFrame) {
+        return Boolean(
+            event?.origin === "https://cdn-sp.tortugasocial.com" &&
+            gameFrame?.contentWindow &&
+            event.source === gameFrame.contentWindow &&
+            event.data?.type === "AVA_HEARTBEAT" &&
+            event.data?.version === 1
+        );
+    }
+
+    function trimReloadHistory(value, now = Date.now()) {
+        const timestamps = Array.isArray(value?.timestamps)
+            ? value.timestamps.filter(timestamp =>
+                Number.isFinite(Number(timestamp)) &&
+                now - Number(timestamp) < RECOVERY_RELOAD_WINDOW_MS
+            )
+            : [];
+        return { timestamps };
+    }
+
+    function checkpointCanRecover(checkpoint, now = Date.now()) {
+        return Boolean(
+            checkpoint?.schemaVersion === RECOVERY_SCHEMA_VERSION &&
+            checkpoint?.recoveryRequested === true &&
+            Number(checkpoint?.expiresAt) > now &&
+            checkpoint?.autoLoopEnabled === true &&
+            typeof checkpoint?.cleaner?.currentMap === "string" &&
+            checkpoint.cleaner.currentMap.length > 0 &&
+            Array.isArray(checkpoint?.autoLoop?.maps) &&
+            checkpoint.autoLoop.maps.includes(checkpoint.cleaner.currentMap)
+        );
+    }
+
+    function findParentGameFrame() {
+        try {
+            return [...document.querySelectorAll("iframe")].find(frame =>
+                /cdn-sp\.tortugasocial\.com\/avataria-vk\/app\/index_js\.html/i.test(frame.src)
+            ) ?? null;
+        } catch {
+            return null;
+        }
+    }
+
+    function initializeParentCrashWatchdog() {
+        const parentState = {
+            armed: false,
+            lastHeartbeatAt: 0,
+            lastHeartbeatPayload: null,
+            lastInstanceId: null,
+            timeoutChecks: 0,
+            reloadBlocked: false,
+            healthySince: 0,
+            reloading: false,
+            crashReloadCount: 0
+        };
+
+        async function reloadAfterCrash() {
+            if (parentState.reloading || parentState.reloadBlocked) return;
+            parentState.reloading = true;
+            const now = Date.now();
+            const history = trimReloadHistory(
+                await gmRead(RECOVERY_RELOAD_HISTORY_KEY, { timestamps: [] }),
+                now
+            );
+            parentState.crashReloadCount = history.timestamps.length;
+            if (history.timestamps.length >= RECOVERY_MAX_RELOADS) {
+                parentState.reloadBlocked = true;
+                parentState.reloading = false;
+                console.error("[AVA RECOVERY] Reload loop protection triggered");
+                return;
+            }
+
+            const snapshot = parentState.lastHeartbeatPayload?.recoverySnapshot;
+            if (snapshot && typeof snapshot === "object") {
+                const checkpoint = {
+                    ...snapshot,
+                    reason: "iframe-heartbeat-timeout",
+                    crashDetectedAt: now,
+                    recoveryRequested: true,
+                    expiresAt: now + RECOVERY_TTL_MS
+                };
+                await gmWrite(RECOVERY_STORAGE_KEY, checkpoint);
+                console.log(`[AVA RECOVERY] Saved crash checkpoint for map ${checkpoint.cleaner?.currentMap ?? "unknown"}`);
+            }
+
+            history.timestamps.push(now);
+            parentState.crashReloadCount = history.timestamps.length;
+            await gmWrite(RECOVERY_RELOAD_HISTORY_KEY, history);
+            console.warn(`[AVA RECOVERY] Reloading VK page (${history.timestamps.length}/${RECOVERY_MAX_RELOADS})`);
+            setTimeout(() => window.location.reload(), 2500);
+        }
+
+        function onHeartbeat(event) {
+            const gameFrame = findParentGameFrame();
+            if (!validHeartbeatEvent(event, gameFrame)) return;
+            const now = Date.now();
+            parentState.lastHeartbeatAt = now;
+            parentState.lastHeartbeatPayload = event.data;
+            parentState.lastInstanceId = event.data.instanceId ?? null;
+            parentState.timeoutChecks = 0;
+            if (!parentState.armed) {
+                parentState.armed = true;
+                parentState.healthySince = now;
+                console.log("[AVA HEARTBEAT] Parent watchdog armed");
+            }
+            if (now - parentState.healthySince >= RECOVERY_RELOAD_WINDOW_MS) {
+                gmWrite(RECOVERY_RELOAD_HISTORY_KEY, { timestamps: [] });
+                parentState.healthySince = now;
+                parentState.reloadBlocked = false;
+            }
+        }
+
+        window.addEventListener("message", onHeartbeat);
+        setInterval(() => {
+            if (!parentState.armed || parentState.reloading || parentState.reloadBlocked) return;
+            const frame = findParentGameFrame();
+            if (!frame) {
+                parentState.timeoutChecks = 0;
+                return;
+            }
+            const age = Date.now() - parentState.lastHeartbeatAt;
+            if (age <= HEARTBEAT_TIMEOUT_MS) {
+                parentState.timeoutChecks = 0;
+                return;
+            }
+            parentState.timeoutChecks++;
+            console.warn(`[AVA HEARTBEAT] Heartbeat lost for ${(age / 1000).toFixed(1)}s`);
+            if (parentState.timeoutChecks >= HEARTBEAT_REQUIRED_TIMEOUT_CHECKS) {
+                console.error("[AVA HEARTBEAT] Game iframe considered crashed");
+                reloadAfterCrash();
+            }
+        }, HEARTBEAT_WATCHDOG_CHECK_MS);
+
+        const parentWindow = typeof unsafeWindow === "object" ? unsafeWindow : window;
+        parentWindow.__AVA_CRASH_WATCHDOG_STATUS__ = function () {
+            const frame = findParentGameFrame();
+            return {
+                armed: parentState.armed,
+                gameFrameFound: Boolean(frame),
+                lastHeartbeatAt: parentState.lastHeartbeatAt || null,
+                lastHeartbeatAgeMs: parentState.lastHeartbeatAt
+                    ? Date.now() - parentState.lastHeartbeatAt
+                    : null,
+                lastInstanceId: parentState.lastInstanceId,
+                timeoutMs: HEARTBEAT_TIMEOUT_MS,
+                crashReloadCount: parentState.crashReloadCount,
+                reloadBlocked: parentState.reloadBlocked
+            };
+        };
+
+        gmRead(RECOVERY_RELOAD_HISTORY_KEY, { timestamps: [] }).then(value => {
+            parentState.crashReloadCount = trimReloadHistory(value).timestamps.length;
+        });
+    }
+
+    const isTopContext = window === window.top;
+    if (isTopContext) {
+        initializeParentCrashWatchdog();
+        return;
+    }
 
     /*
      * ============================================================
@@ -58,6 +259,115 @@
     };
 
     const w = unsafeWindow;
+
+    const childHeartbeatInstanceId =
+        `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const crashRecoveryState = {
+        recoveryInProgress: false,
+        checkpointFound: false,
+        checkpointSavedAt: 0,
+        targetMap: null,
+        interruptedTargetId: null,
+        phase: "idle",
+        lastRecoveryError: null,
+        lastCheckpointWriteAt: 0
+    };
+
+    function serializableEntries(value) {
+        try {
+            return [...(value ?? [])].map(entry =>
+                Array.isArray(entry) ? entry.slice(0, 2) : entry
+            );
+        } catch {
+            return [];
+        }
+    }
+
+    function buildRecoverySnapshot() {
+        const cleaner = w.__AVA_MAP_CLEANER__;
+        const autoLoop = w.__AVA_AUTO_CLEAN_LOOP__;
+        const now = Date.now();
+        return {
+            schemaVersion: RECOVERY_SCHEMA_VERSION,
+            savedAt: now,
+            expiresAt: now + RECOVERY_TTL_MS,
+            recoveryRequested: false,
+            autoLoopEnabled: Boolean(autoLoop?.enabled),
+            autoLoop: {
+                running: Boolean(autoLoop?.running),
+                phase: autoLoop?.phase ?? null,
+                cycleMode: autoLoop?.cycleMode ?? null,
+                nextCycleMode: autoLoop?.nextCycleMode ?? null,
+                maps: Array.isArray(autoLoop?.maps) ? autoLoop.maps.slice() : [],
+                mapIndex: Number(cleaner?._mapIndex ?? 0)
+            },
+            cleaner: {
+                running: Boolean(cleaner?.running),
+                paused: Boolean(cleaner?.paused),
+                pauseReason: cleaner?.pauseReason ?? null,
+                currentMap: cleaner?.currentMap ?? null,
+                currentTargetId: cleaner?.currentTarget
+                    ? stableObjectId(cleaner.currentTarget)
+                    : null,
+                completedObjectIds: serializableEntries(cleaner?._completedObjects),
+                skippedObjectIds: serializableEntries(cleaner?._skippedObjects),
+                inactiveObjectIds: serializableEntries(cleaner?._inactiveObjects),
+                attemptEntries: serializableEntries(cleaner?._attempts)
+            }
+        };
+    }
+
+    function requestRecoveryCheckpointSave(reason = "state-change", force = false) {
+        const now = Date.now();
+        if (!force && now - crashRecoveryState.lastCheckpointWriteAt < 10000) {
+            return Promise.resolve(false);
+        }
+        crashRecoveryState.lastCheckpointWriteAt = now;
+        return gmWrite(RECOVERY_STORAGE_KEY, {
+            ...buildRecoverySnapshot(),
+            reason
+        });
+    }
+
+    function parentVkOrigin() {
+        try {
+            const origin = new URL(document.referrer).origin;
+            return origin === "https://vk.ru" || origin === "https://vk.com"
+                ? origin
+                : null;
+        } catch {
+            return null;
+        }
+    }
+
+    function startChildHeartbeat() {
+        const detectedOrigin = parentVkOrigin();
+        const targetOrigins = detectedOrigin
+            ? [detectedOrigin]
+            : ["https://vk.ru", "https://vk.com"];
+        const send = () => {
+            try {
+                const payload = {
+                    type: "AVA_HEARTBEAT",
+                    version: 1,
+                    instanceId: childHeartbeatInstanceId,
+                    sentAt: Date.now(),
+                    playable: gameLooksPlayable(),
+                    recoverySnapshot: buildRecoverySnapshot()
+                };
+                for (const targetOrigin of targetOrigins) {
+                    window.parent.postMessage(payload, targetOrigin);
+                }
+                requestRecoveryCheckpointSave("periodic-heartbeat");
+            } catch (error) {
+                console.warn("[AVA HEARTBEAT] Child heartbeat failed", error);
+            }
+        };
+        send();
+        setInterval(send, HEARTBEAT_INTERVAL_MS);
+        console.log("[AVA HEARTBEAT] Child heartbeat started");
+        return true;
+    }
 
     if (w.__AVA_V11_INSTALLED__) {
         console.warn("[AVA-V11] Déjà installé");
@@ -2948,6 +3258,8 @@
             _lastScanTargets: [],
             _yardSkippedReloadCount: 0,
             _yardNeedsReloadForSkippedObjects: false,
+            _recoveryTargetId: null,
+            _restoredRecoveryState: null,
 
             start(options = {}) {
                 if (this.running) {
@@ -2982,6 +3294,7 @@
                 this._yardSkippedReloadCount = 0;
                 this._yardNeedsReloadForSkippedObjects = false;
                 cleanerLog("Started");
+                requestRecoveryCheckpointSave("cleaner-start", true);
                 this._moveToConfiguredMap();
                 return true;
             },
@@ -2995,6 +3308,7 @@
                 this._rejectManualInteraction("cleaner stopped");
                 this.remainingTargets = 0;
                 cleanerLog("Stopped", this._summary());
+                requestRecoveryCheckpointSave("cleaner-stop", true);
                 return this.status();
             },
 
@@ -3002,6 +3316,7 @@
                 this.paused = true;
                 this.pauseReason = reason;
                 cleanerLog(reason === "energy" ? "Paused: energy" : "Paused");
+                requestRecoveryCheckpointSave("cleaner-pause", true);
                 return this.status();
             },
 
@@ -3031,8 +3346,50 @@
                 this.pauseReason = null;
                 this._emptyScans = 0;
                 cleanerLog(energy ? `Energy restored: ${formatEnergy(energy)}. Resuming.` : "Resumed");
+                requestRecoveryCheckpointSave("cleaner-resume", true);
                 this._scheduleScan(0);
                 return this.status();
+            },
+
+            resumeFromRecovery(checkpoint) {
+                const mapId = String(checkpoint?.cleaner?.currentMap ?? "");
+                const maps = Array.isArray(checkpoint?.autoLoop?.maps)
+                    ? checkpoint.autoLoop.maps.map(String)
+                    : [];
+                if (!mapId || !maps.includes(mapId)) {
+                    cleanerWarn("Recovery checkpoint has no valid current map");
+                    return false;
+                }
+
+                this._clearTimers();
+                this._restoreWrappedTargets();
+                this.config.maps = maps.slice();
+                this._mapIndex = Number(checkpoint.autoLoop.mapIndex ?? maps.indexOf(mapId));
+                if (!Number.isInteger(this._mapIndex) || maps[this._mapIndex] !== mapId) {
+                    this._mapIndex = maps.indexOf(mapId);
+                }
+                this.visitedMaps = maps.slice(0, this._mapIndex);
+                this.running = true;
+                this.paused = false;
+                this.pauseReason = null;
+                this.busy = false;
+                this.currentTarget = null;
+                this.currentMap = mapId;
+                this.startedAt = performance.now();
+                this._activeAction = null;
+                this._activeManualPromise = null;
+                this._timers = [];
+                this._wrappedTargets = [];
+                this._recoveryTargetId = checkpoint.cleaner.currentTargetId ?? null;
+                this._restoredRecoveryState = {
+                    completed: new Set(checkpoint.cleaner.completedObjectIds ?? []),
+                    skipped: new Set(checkpoint.cleaner.skippedObjectIds ?? []),
+                    inactive: new Set(checkpoint.cleaner.inactiveObjectIds ?? []),
+                    attempts: new Map(checkpoint.cleaner.attemptEntries ?? [])
+                };
+                cleanerLog(`[AVA RECOVERY] Teleporting back to ${mapId}`);
+                this._moveToConfiguredMap();
+                return true;
             },
 
             status() {
@@ -3371,9 +3728,17 @@
                 this._activeManualPromise = null;
                 this._lastScanTargets = [];
                 this._yardNeedsReloadForSkippedObjects = false;
+                if (this._restoredRecoveryState) {
+                    this._completedObjects = this._restoredRecoveryState.completed;
+                    this._skippedObjects = this._restoredRecoveryState.skipped;
+                    this._inactiveObjects = this._restoredRecoveryState.inactive;
+                    this._attempts = this._restoredRecoveryState.attempts;
+                    this._restoredRecoveryState = null;
+                }
                 this._restoreWrappedTargets();
                 resetPickWorkScreenCache();
                 cleanerLog(`Moving to ${mapId}`);
+                requestRecoveryCheckpointSave("cleaner-map-change", true);
                 if (typeof w.__AVA_GO_WORK__ === "function") {
                     w.__AVA_GO_WORK__(mapId);
                 }
@@ -3431,6 +3796,10 @@
 
                 if (screen) {
                     if (isCurrentWorkFinished()) {
+                        if (crashRecoveryState.recoveryInProgress) {
+                            cleanerLog(`[AVA RECOVERY] Recovered zone ${mapId} is already finished; skipping`);
+                            finishCrashRecovery();
+                        }
                         this._skipCurrentWorkArea(
                             mapId,
                             `[WORK] Zone already completed, skipping: ${mapId}`
@@ -3438,6 +3807,11 @@
                         return;
                     }
 
+                    if (crashRecoveryState.recoveryInProgress) {
+                        cleanerLog("[AVA RECOVERY] Work screen loaded");
+                        cleanerLog("[AVA RECOVERY] Rescanning interrupted zone");
+                        finishCrashRecovery();
+                    }
                     this._scheduleScan(0);
                     return;
                 }
@@ -3447,6 +3821,10 @@
                     this.config.pickWorkScreenTimeout
                 ) {
                     cleanerLog("[WORK] PickWorkScreen not found; continuing normal scan");
+                    if (crashRecoveryState.recoveryInProgress) {
+                        cleanerLog("[AVA RECOVERY] Work screen timeout; rescanning interrupted zone");
+                        finishCrashRecovery();
+                    }
                     this._scheduleScan(0);
                     return;
                 }
@@ -3491,13 +3869,22 @@
                 });
 
                 if (this.config.targetSelectionMode === "discovery-order") {
-                    return rankedTargets;
+                    return this._prioritizeRecoveryTarget(rankedTargets);
                 }
 
-                return rankedTargets.sort(
+                return this._prioritizeRecoveryTarget(rankedTargets.sort(
                     (left, right) =>
                         left.distance - right.distance
-                );
+                ));
+            },
+
+            _prioritizeRecoveryTarget(rankedTargets) {
+                if (!this._recoveryTargetId) return rankedTargets;
+                return rankedTargets.sort((left, right) => {
+                    const leftMatches = stableObjectId(left.target) === this._recoveryTargetId;
+                    const rightMatches = stableObjectId(right.target) === this._recoveryTargetId;
+                    return leftMatches === rightMatches ? 0 : (leftMatches ? -1 : 1);
+                });
             },
 
             _resetButterflyState() {
@@ -3853,6 +4240,18 @@
                 const now = Date.now();
                 const discoveredTargets =
                     discoverCleanableObjects(this.config);
+
+                if (this._recoveryTargetId) {
+                    const interruptedStillExists = discoveredTargets.some(
+                        target => stableObjectId(target) === this._recoveryTargetId
+                    );
+                    if (!interruptedStillExists) {
+                        cleanerLog(
+                            `[AVA RECOVERY] Previous target ${this._recoveryTargetId} no longer exists; continuing`
+                        );
+                        this._recoveryTargetId = null;
+                    }
+                }
 
                 const activeTargets = [];
                 const availableTargets = [];
@@ -4213,6 +4612,7 @@
                 this.interactionToken++;
                 const token = this.interactionToken;
                 cleanerLog(`Cleaning ${targetId}`);
+                requestRecoveryCheckpointSave("interaction-start", true);
                 installFinishInteractionWatch(target, this, token);
                 try {
                     const action = new InteractAction(target, null);
@@ -4295,6 +4695,7 @@
                 }
 
                 cleanerLog(`Catching butterfly ${targetId}`);
+                requestRecoveryCheckpointSave("butterfly-interaction-start", true);
                 installFinishInteractionWatch(target, this, token);
 
                 let lastMoveAt = 0;
@@ -4554,6 +4955,10 @@
                 if (this.running && !this.paused) {
                     this._scheduleScan(this.config.scanDelay);
                 }
+                requestRecoveryCheckpointSave(
+                    success === true ? "interaction-complete" : "interaction-failed",
+                    true
+                );
                 return true;
             },
 
@@ -4575,6 +4980,7 @@
                 if (reason) {
                     cleanerLog(`Reason: ${reason}`);
                 }
+                requestRecoveryCheckpointSave("target-inactive", true);
             },
 
             _registerFailure(targetId, reason, target = null) {
@@ -4583,6 +4989,7 @@
                     this._getMaxAttemptsForTarget(target, targetId);
 
                 cleanerWarn(`${targetId} failed: ${reason}`);
+                requestRecoveryCheckpointSave("interaction-failed", true);
                 if (attempts >= maxAttempts) {
                     this._skipObject(targetId, maxAttempts);
                 }
@@ -4601,6 +5008,7 @@
                 }
 
                 cleanerWarn(`Object skipped after ${maxAttempts} failures`, targetId);
+                requestRecoveryCheckpointSave("target-skipped", true);
             }
         };
 
@@ -4645,6 +5053,7 @@
             startTimeoutMs: AVA_AUTO_CLEAN_LOOP_START_TIMEOUT_MS,
             startDelayMs: 3000,
             pollMs: 2000,
+            recoveryInProgress: false,
             _timers: [],
 
             on() {
@@ -4708,7 +5117,8 @@
                     nextReloadAt: this.nextReloadAt,
                     nextReloadInMs: this.nextReloadAt
                         ? Math.max(0, this.nextReloadAt - Date.now())
-                        : null
+                        : null,
+                    recoveryInProgress: this.recoveryInProgress
                 };
             },
 
@@ -4808,11 +5218,18 @@
                     return;
                 }
 
+                if (this.recoveryInProgress) {
+                    return;
+                }
+
                 this._loadCycleMode();
                 this._markWaitingForGame();
 
                 this._setTimer(() => {
                     if (!this.enabled) {
+                        return;
+                    }
+                    if (this.recoveryInProgress) {
                         return;
                     }
 
@@ -4865,6 +5282,7 @@
                 console.log(
                     `[AVA AUTO LOOP] Cleaning ${this.maps.join(" then ")} (${this.cycleMode})`
                 );
+                requestRecoveryCheckpointSave("auto-cycle-start", true);
 
                 try {
                     w.__AVA_MAP_CLEANER__.start({
@@ -4926,6 +5344,7 @@
                 this._refreshCycleConfig();
                 this._storeCycleMode(this.nextCycleMode);
                 this.nextReloadAt = this.completedAt + this.idleMs;
+                requestRecoveryCheckpointSave("auto-cycle-idle", true);
 
                 console.log(
                     `[AVA AUTO LOOP] Idle for ${Math.round(this.idleMs / 60000)} minutes before reload; next cycle: ${this.nextCycleMode}`
@@ -4941,7 +5360,11 @@
 
                 this.phase = "reloading";
                 console.log("[AVA AUTO LOOP] Reloading page");
-                w.location.reload();
+                gmWrite(RECOVERY_STORAGE_KEY, {
+                    ...buildRecoverySnapshot(),
+                    reason: "scheduled-cycle-reload",
+                    recoveryRequested: false
+                }).finally(() => w.location.reload());
             }
         };
 
@@ -4960,10 +5383,104 @@
 
         if (loop.enabled) {
             console.log("[AVA AUTO LOOP] Script toggle is ON");
-            loop._startCycleWhenReady();
         }
 
         return loop;
+    }
+
+    function recoverySystemsReady() {
+        try {
+            return Boolean(
+                gameLooksPlayable() &&
+                getWorkManager() &&
+                getWorkLocationClass() &&
+                w.__AVA_MAP_CLEANER__ &&
+                w.__AVA_AUTO_CLEAN_LOOP__ &&
+                state.destinationCommandsReady
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function finishCrashRecovery() {
+        const autoLoop = w.__AVA_AUTO_CLEAN_LOOP__;
+        crashRecoveryState.phase = "resumed";
+        crashRecoveryState.recoveryInProgress = false;
+        if (autoLoop) {
+            autoLoop.phase = "cleaning";
+            autoLoop.recoveryInProgress = false;
+            autoLoop._setTimer(() => autoLoop._watchCleaner(), autoLoop.pollMs);
+        }
+        cleanerLog("[AVA RECOVERY] Cleaner resumed");
+        gmDelete(RECOVERY_STORAGE_KEY);
+    }
+
+    async function startCrashRecoveryIfNeeded() {
+        const checkpoint = await gmRead(RECOVERY_STORAGE_KEY, null);
+        crashRecoveryState.checkpointFound = Boolean(checkpoint);
+        crashRecoveryState.checkpointSavedAt = Number(checkpoint?.savedAt ?? 0);
+
+        if (!checkpointCanRecover(checkpoint)) {
+            if (checkpoint?.recoveryRequested === true || Number(checkpoint?.expiresAt) <= Date.now()) {
+                await gmDelete(RECOVERY_STORAGE_KEY);
+            }
+            return false;
+        }
+
+        const autoLoop = w.__AVA_AUTO_CLEAN_LOOP__;
+        crashRecoveryState.recoveryInProgress = true;
+        crashRecoveryState.targetMap = checkpoint.cleaner.currentMap;
+        crashRecoveryState.interruptedTargetId = checkpoint.cleaner.currentTargetId ?? null;
+        crashRecoveryState.phase = "waiting-for-game";
+        autoLoop.recoveryInProgress = true;
+        autoLoop.phase = "recovering";
+        autoLoop.enabled = true;
+        autoLoop.running = true;
+        autoLoop._clearTimers();
+        console.log("[AVA RECOVERY] Recovery checkpoint found");
+        console.log("[AVA RECOVERY] Waiting for game readiness");
+
+        const startedAt = performance.now();
+        return new Promise(resolve => {
+            const check = () => {
+                if (!crashRecoveryState.recoveryInProgress) {
+                    resolve(false);
+                    return;
+                }
+                if (recoverySystemsReady()) {
+                    autoLoop.cycleMode = checkpoint.autoLoop.cycleMode === "yard" ? "yard" : "full";
+                    autoLoop.nextCycleMode = checkpoint.autoLoop.nextCycleMode === "full" ? "full" : "yard";
+                    autoLoop.maps = checkpoint.autoLoop.maps.slice();
+                    autoLoop.phase = "recovering";
+                    crashRecoveryState.phase = "teleporting";
+                    const resumed = w.__AVA_MAP_CLEANER__.resumeFromRecovery(checkpoint);
+                    if (!resumed) {
+                        crashRecoveryState.lastRecoveryError = "cleaner refused recovery checkpoint";
+                        crashRecoveryState.recoveryInProgress = false;
+                        autoLoop.recoveryInProgress = false;
+                        autoLoop._startCycleWhenReady();
+                        resolve(false);
+                        return;
+                    }
+                    autoLoop._setTimer(() => autoLoop._watchCleaner(), autoLoop.pollMs);
+                    resolve(true);
+                    return;
+                }
+                if (performance.now() - startedAt >= 60000) {
+                    crashRecoveryState.lastRecoveryError = "game readiness timeout";
+                    crashRecoveryState.phase = "failed";
+                    crashRecoveryState.recoveryInProgress = false;
+                    autoLoop.recoveryInProgress = false;
+                    console.error("[AVA RECOVERY] Game readiness timeout");
+                    autoLoop._startCycleWhenReady();
+                    resolve(false);
+                    return;
+                }
+                setTimeout(check, 1000);
+            };
+            check();
+        });
     }
 
     /*
@@ -6533,6 +7050,10 @@
                 commands: "__AVA_AUTO_CLEAN_LOOP__.on(), __AVA_AUTO_CLEAN_LOOP__.off(), __AVA_AUTO_CLEAN_LOOP__.toggle(), __AVA_AUTO_CLEAN_LOOP__.status()"
             },
             {
+                section: "Crash recovery",
+                commands: "__AVA_RECOVERY_STATUS__(), __AVA_IS_WORK_FINISHED__()"
+            },
+            {
                 section: "Status",
                 commands: "__AVA_STATUS__, __AVA_HELP__"
             }
@@ -6696,6 +7217,10 @@
                 startupWatchdogPlayable:
                     gameLooksPlayable(),
 
+                crashRecovery:
+                    w.__AVA_RECOVERY_STATUS__?.() ??
+                    null,
+
                 currentAvatarCaptured:
                     Boolean(w.__AVA_CURRENT_AVATAR__),
 
@@ -6712,6 +7237,25 @@
     initializeMapCleaner();
     installMapCleanerWhenReady();
     initializeAutoCleanLoop();
+    w.__AVA_RECOVERY_STATUS__ = function () {
+        return {
+            recoveryInProgress: crashRecoveryState.recoveryInProgress,
+            checkpointFound: crashRecoveryState.checkpointFound,
+            checkpointAgeMs: crashRecoveryState.checkpointSavedAt
+                ? Date.now() - crashRecoveryState.checkpointSavedAt
+                : null,
+            targetMap: crashRecoveryState.targetMap,
+            interruptedTargetId: crashRecoveryState.interruptedTargetId,
+            phase: crashRecoveryState.phase,
+            lastRecoveryError: crashRecoveryState.lastRecoveryError
+        };
+    };
+    startCrashRecoveryIfNeeded().then(recovered => {
+        if (!recovered && w.__AVA_AUTO_CLEAN_LOOP__?.enabled) {
+            w.__AVA_AUTO_CLEAN_LOOP__._startCycleWhenReady();
+        }
+    });
+    startChildHeartbeat();
     startGameStartupWatchdog();
 
     console.log(
