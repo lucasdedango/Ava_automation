@@ -11,3 +11,4 @@ These checks require the live VK application and cannot be reproduced by the loc
 7. Cause four crashes within ten minutes. Confirm only the first three trigger automatic reloads and the parent status reports `reloadBlocked: true` after loop protection activates.
 8. Navigate away from the VK game so its iframe is removed. Confirm the watchdog does not reload the page.
 9. Allow healthy heartbeats for ten minutes, then verify the reload history is cleared and recovery can reload again.
+10. Let the game iframe crash while the auto loop is in `idle`. Confirm VK stays open until `nextReloadAt`, then reloads without restoring the completed map.

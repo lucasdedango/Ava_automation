@@ -110,11 +110,14 @@
             reloadBlocked: false,
             healthySince: 0,
             reloading: false,
-            crashReloadCount: 0
+            crashReloadCount: 0,
+            idleReloadDeferredUntil: 0
         };
 
-        async function reloadAfterCrash() {
+        async function reloadAfterCrash(options = {}) {
             if (parentState.reloading || parentState.reloadBlocked) return;
+            const recoveryRequested = options.recoveryRequested !== false;
+            const reason = options.reason ?? "iframe-heartbeat-timeout";
             parentState.reloading = true;
             const now = Date.now();
             const history = trimReloadHistory(
@@ -133,13 +136,17 @@
             if (snapshot && typeof snapshot === "object") {
                 const checkpoint = {
                     ...snapshot,
-                    reason: "iframe-heartbeat-timeout",
+                    reason,
                     crashDetectedAt: now,
-                    recoveryRequested: true,
+                    recoveryRequested,
                     expiresAt: now + RECOVERY_TTL_MS
                 };
                 await gmWrite(RECOVERY_STORAGE_KEY, checkpoint);
-                console.log(`[AVA RECOVERY] Saved crash checkpoint for map ${checkpoint.cleaner?.currentMap ?? "unknown"}`);
+                if (recoveryRequested) {
+                    console.log(`[AVA RECOVERY] Saved crash checkpoint for map ${checkpoint.cleaner?.currentMap ?? "unknown"}`);
+                } else {
+                    console.log("[AVA HEARTBEAT] Idle period ended; reloading for the next cycle");
+                }
             }
 
             history.timestamps.push(now);
@@ -157,6 +164,7 @@
             parentState.lastHeartbeatPayload = event.data;
             parentState.lastInstanceId = event.data.instanceId ?? null;
             parentState.timeoutChecks = 0;
+            parentState.idleReloadDeferredUntil = 0;
             if (!parentState.armed) {
                 parentState.armed = true;
                 parentState.healthySince = now;
@@ -182,6 +190,27 @@
                 parentState.timeoutChecks = 0;
                 return;
             }
+            const autoLoopSnapshot =
+                parentState.lastHeartbeatPayload?.recoverySnapshot?.autoLoop;
+            const idleUntil =
+                Number(autoLoopSnapshot?.nextReloadAt ?? 0);
+            if (autoLoopSnapshot?.phase === "idle" && idleUntil > Date.now()) {
+                parentState.timeoutChecks = 0;
+                if (parentState.idleReloadDeferredUntil !== idleUntil) {
+                    parentState.idleReloadDeferredUntil = idleUntil;
+                    console.warn(
+                        `[AVA HEARTBEAT] Game crashed while idle; reload deferred until ${new Date(idleUntil).toLocaleTimeString()}`
+                    );
+                }
+                return;
+            }
+            if (autoLoopSnapshot?.phase === "idle" && idleUntil > 0) {
+                reloadAfterCrash({
+                    recoveryRequested: false,
+                    reason: "idle-cycle-due"
+                });
+                return;
+            }
             parentState.timeoutChecks++;
             console.warn(`[AVA HEARTBEAT] Heartbeat lost for ${(age / 1000).toFixed(1)}s`);
             if (parentState.timeoutChecks >= HEARTBEAT_REQUIRED_TIMEOUT_CHECKS) {
@@ -203,6 +232,7 @@
                 lastInstanceId: parentState.lastInstanceId,
                 timeoutMs: HEARTBEAT_TIMEOUT_MS,
                 crashReloadCount: parentState.crashReloadCount,
+                idleReloadDeferredUntil: parentState.idleReloadDeferredUntil || null,
                 reloadBlocked: parentState.reloadBlocked
             };
         };
@@ -230,32 +260,10 @@
     const AVA_AUTO_CLEAN_LOOP_ON = false;
     const AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS = 40 * 60 * 1000;
     const AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS = 30 * 60 * 1000;
-    const AVA_AUTO_CLEAN_LOOP_START_TIMEOUT_MS = 60 * 1000;
     const AVA_BUTTERFLY_MAX_ATTEMPTS = 3;
     const AVA_YARD_MAX_RETRIES_PER_OBJECT = 1;
     const AVA_YARD_INTERACTION_TIMEOUT_MS = 40000;
     const MIN_ENERGY_TO_ACT = 10;
-
-    const AVA_STARTUP_WATCHDOG_ON = true;
-    const AVA_STARTUP_WATCHDOG_OPTIONS = {
-        initialDelayMs: 15000,
-        timeoutMs: 45000,
-        pollMs: 2000,
-        reloadDelayMs: 3000,
-        maxReloads: 3,
-        storageKey: "__AVA_STARTUP_RELOAD_COUNT__"
-    };
-
-    const startupWatchdog = {
-        initialDelayMs: AVA_STARTUP_WATCHDOG_OPTIONS.initialDelayMs,
-        timeoutMs: AVA_STARTUP_WATCHDOG_OPTIONS.timeoutMs,
-        pollMs: AVA_STARTUP_WATCHDOG_OPTIONS.pollMs,
-        reloadDelayMs: AVA_STARTUP_WATCHDOG_OPTIONS.reloadDelayMs,
-        maxReloads: AVA_STARTUP_WATCHDOG_OPTIONS.maxReloads,
-        storageKey: AVA_STARTUP_WATCHDOG_OPTIONS.storageKey,
-        startedAt: performance.now(),
-        timer: null
-    };
 
     const w = unsafeWindow;
 
@@ -298,7 +306,8 @@
                 cycleMode: autoLoop?.cycleMode ?? null,
                 nextCycleMode: autoLoop?.nextCycleMode ?? null,
                 maps: Array.isArray(autoLoop?.maps) ? autoLoop.maps.slice() : [],
-                mapIndex: Number(cleaner?._mapIndex ?? 0)
+                mapIndex: Number(cleaner?._mapIndex ?? 0),
+                nextReloadAt: Number(autoLoop?.nextReloadAt ?? 0)
             },
             cleaner: {
                 running: Boolean(cleaner?.running),
@@ -2266,106 +2275,6 @@
         } catch {
             return false;
         }
-    }
-
-    function startGameStartupWatchdog() {
-        if (!AVA_STARTUP_WATCHDOG_ON) {
-            return false;
-        }
-
-        const watchdog =
-            startupWatchdog;
-
-        setTimeout(() => {
-            watchdog.startedAt =
-                performance.now();
-
-            function check() {
-                if (gameLooksPlayable()) {
-                    try {
-                        sessionStorage.removeItem(
-                            watchdog.storageKey
-                        );
-                    } catch {}
-
-                    console.log(
-                        "[AVA WATCHDOG] Game startup successful"
-                    );
-
-                    return;
-                }
-
-                const elapsed =
-                    performance.now() -
-                    watchdog.startedAt;
-
-                if (elapsed < watchdog.timeoutMs) {
-                    watchdog.timer =
-                        setTimeout(
-                            check,
-                            watchdog.pollMs
-                        );
-
-                    return;
-                }
-
-                let reloadCount = 0;
-                let storageAvailable = true;
-
-                try {
-                    reloadCount =
-                        Number(
-                            sessionStorage.getItem(
-                                watchdog.storageKey
-                            ) ?? 0
-                        );
-                } catch {
-                    reloadCount = 0;
-                    storageAvailable = false;
-                }
-
-                if (!storageAvailable) {
-                    console.error(
-                        "[AVA WATCHDOG] Cannot track reload attempts; not reloading"
-                    );
-
-                    return;
-                }
-
-                if (reloadCount >= watchdog.maxReloads) {
-                    console.error(
-                        "[AVA WATCHDOG] Game failed to launch after maximum reload attempts"
-                    );
-
-                    return;
-                }
-
-                try {
-                    sessionStorage.setItem(
-                        watchdog.storageKey,
-                        String(reloadCount + 1)
-                    );
-                } catch {
-                    console.error(
-                        "[AVA WATCHDOG] Cannot store reload attempt; not reloading"
-                    );
-
-                    return;
-                }
-
-                console.warn(
-                    `[AVA WATCHDOG] Startup timeout; reloading page (${reloadCount + 1}/${watchdog.maxReloads})`
-                );
-
-                setTimeout(() => {
-                    w.location.reload();
-                }, watchdog.reloadDelayMs);
-            }
-
-            check();
-        }, watchdog.initialDelayMs);
-
-        return true;
     }
 
     function hasWorldReference(object) {
@@ -5165,7 +5074,6 @@
             fullThenYardMs: AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS,
             yardThenFullMs: AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS,
             idleMs: AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS,
-            startTimeoutMs: AVA_AUTO_CLEAN_LOOP_START_TIMEOUT_MS,
             startDelayMs: 3000,
             pollMs: 2000,
             recoveryInProgress: false,
@@ -5222,7 +5130,6 @@
                     idleMs: this.idleMs,
                     fullThenYardMs: this.fullThenYardMs,
                     yardThenFullMs: this.yardThenFullMs,
-                    startTimeoutMs: this.startTimeoutMs,
                     waitingStartedAt: this.waitingStartedAt,
                     waitingForGameMs: this.waitingStartedAt
                         ? Date.now() - this.waitingStartedAt
@@ -5300,32 +5207,6 @@
                 this.phase = "waiting-for-game";
             },
 
-            _maybeReloadStuckStartup() {
-                if (
-                    !this.enabled ||
-                    this.phase !== "waiting-for-game" ||
-                    !this.waitingStartedAt
-                ) {
-                    return false;
-                }
-
-                const elapsed =
-                    Date.now() -
-                    this.waitingStartedAt;
-
-                if (elapsed < this.startTimeoutMs) {
-                    return false;
-                }
-
-                this.phase = "startup-reloading";
-                console.warn(
-                    `[AVA AUTO LOOP] Game not playable after ${Math.round(elapsed / 1000)} seconds; reloading page`
-                );
-
-                this._setTimer(() => this._reload(), 1000);
-                return true;
-            },
-
             _startCycleWhenReady() {
                 this._clearTimers();
 
@@ -5349,18 +5230,12 @@
                     }
 
                     if (!w.__AVA_MAP_CLEANER__) {
-                        if (!this._maybeReloadStuckStartup()) {
-                            this._startCycleWhenReady();
-                        }
+                        this._startCycleWhenReady();
                         return;
                     }
 
                     if (!gameLooksPlayable()) {
                         this._markWaitingForGame();
-
-                        if (this._maybeReloadStuckStartup()) {
-                            return;
-                        }
 
                         this._setTimer(
                             () => this._startCycleWhenReady(),
@@ -7326,12 +7201,6 @@
                     ).nextReloadInMs ??
                     null,
 
-                startupWatchdogEnabled:
-                    AVA_STARTUP_WATCHDOG_ON,
-
-                startupWatchdogPlayable:
-                    gameLooksPlayable(),
-
                 crashRecovery:
                     w.__AVA_RECOVERY_STATUS__?.() ??
                     null,
@@ -7371,7 +7240,6 @@
         }
     });
     startChildHeartbeat();
-    startGameStartupWatchdog();
 
     console.log(
         "%c[AVA-V12] Safe Inspector installé",
