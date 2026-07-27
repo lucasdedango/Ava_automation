@@ -208,6 +208,7 @@ candidates.filter(row =&gt; row.accepted).map(row =&gt; ({
 <pre><button class="copy">Copier</button><code>__AVA_MAP_CLEANER__.start({
     maps: ["garbage"]
 });</code></pre>
+      <p class="note"><strong>Zones terminées :</strong> le cleaner recherche directement le texte visible <code>All work here is finished</code> dans la scène OpenFL, sans dépendre de la classe ou de la hiérarchie du panneau Garden/Yard.</p>
       <h3>Boucle automatique yard + garden / yard seul</h3>
       <p><code>__AVA_AUTO_CLEAN_LOOP__</code> démarre automatiquement seulement si <code>AVA_AUTO_CLEAN_LOOP_ON</code> vaut <code>true</code> au début du userscript. Elle attend que le jeu soit jouable sans lancer de watchdog de démarrage, nettoie d'abord <code>["garbage", "garden"]</code>, attend <code>AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS</code>, recharge pour nettoyer seulement <code>["garbage"]</code>, puis attend <code>AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS</code> avant de recommencer le cycle complet. Si l’iframe plante pendant cette attente, le watchdog VK diffère le rechargement jusqu’au prochain cycle au lieu de relancer immédiatement le jeu.</p>
       <pre><button class="copy">Copier</button><code>// Au début du userscript :

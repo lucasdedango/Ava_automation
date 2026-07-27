@@ -10,6 +10,15 @@ test('userscript parent match is limited to vk.ru', () => {
     assert.doesNotMatch(source, /\/\/ @match\s+https:\/\/vk\.com\/\*/);
 });
 
+test('work completion detection scans the OpenFL stage without PickWorkScreen', () => {
+    const implementation = source.match(
+        /function isCurrentWorkFinished\(\) \{[\s\S]*?\n    \}\r?\n\r?\n    function gameLooksPlayable/
+    )?.[0] ?? '';
+    assert.match(implementation, /w\.openfl\?\.Lib\?\.current\?\.stage/);
+    assert.match(implementation, /\["text", "__text", "htmlText"\]/);
+    assert.doesNotMatch(implementation, /findPickWorkScreen/);
+});
+
 function loadParentContext() {
     const messageListeners = [];
     const intervals = [];

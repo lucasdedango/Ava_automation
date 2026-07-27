@@ -2248,12 +2248,127 @@
     }
 
     function isCurrentWorkFinished() {
-        const screen =
-            findPickWorkScreen();
-        const text =
-            pickWorkScreenText(screen);
+        const expectedText =
+            "All work here is finished";
+        let stage = null;
 
-        return text === "All work here is finished";
+        try {
+            stage =
+                w.openfl?.Lib?.current?.stage ??
+                null;
+        } catch {
+            stage = null;
+        }
+
+        if (!stage) {
+            return false;
+        }
+
+        const stack = [{
+            object: stage,
+            visible: true
+        }];
+        const visited =
+            new WeakSet();
+        const maxNodes =
+            10000;
+        let inspected =
+            0;
+
+        while (stack.length > 0 && inspected < maxNodes) {
+            const entry =
+                stack.pop();
+            const object =
+                entry.object;
+
+            if (
+                !object ||
+                (typeof object !== "object" && typeof object !== "function") ||
+                visited.has(object)
+            ) {
+                continue;
+            }
+
+            visited.add(object);
+            inspected++;
+
+            let visible =
+                entry.visible;
+
+            try {
+                if (object.visible === false || Number(object.alpha) === 0) {
+                    visible = false;
+                }
+            } catch {}
+
+            if (!visible) {
+                continue;
+            }
+
+            for (const property of ["text", "__text", "htmlText"]) {
+                let value = "";
+
+                try {
+                    value = String(object[property] ?? "")
+                        .replace(/<[^>]*>/g, " ")
+                        .replace(/&nbsp;/gi, " ")
+                        .replace(/\s+/g, " ")
+                        .trim();
+                } catch {
+                    value = "";
+                }
+
+                if (value.includes(expectedText)) {
+                    return true;
+                }
+            }
+
+            let children = null;
+
+            try {
+                children =
+                    object.__children ??
+                    object.children ??
+                    null;
+            } catch {
+                children = null;
+            }
+
+            let childCount = 0;
+
+            try {
+                childCount = children && typeof children.length === "number"
+                    ? children.length
+                    : (
+                        typeof object.getChildAt === "function"
+                            ? Number(object.numChildren ?? 0)
+                            : 0
+                    );
+            } catch {
+                childCount = 0;
+            }
+
+            if (!Number.isFinite(childCount) || childCount <= 0) {
+                continue;
+            }
+
+            for (let index = childCount - 1; index >= 0; index--) {
+                try {
+                    const child = children && typeof children.length === "number"
+                        ? children[index]
+                        : object.getChildAt(index);
+
+                    if (child) {
+                        stack.push({
+                            object: child,
+                            visible
+                        });
+                    }
+                } catch {}
+            }
+        }
+
+        return false;
     }
 
     function gameLooksPlayable() {
@@ -3728,6 +3843,18 @@
                     return;
                 }
 
+                if (isCurrentWorkFinished()) {
+                    if (crashRecoveryState.recoveryInProgress) {
+                        cleanerLog(`[AVA RECOVERY] Recovered zone ${mapId} is already finished; skipping`);
+                        finishCrashRecovery();
+                    }
+                    this._skipCurrentWorkArea(
+                        mapId,
+                        `[WORK] Zone already completed, skipping: ${mapId}`
+                    );
+                    return;
+                }
+
                 const screen =
                     findPickWorkScreen();
 
@@ -3767,18 +3894,6 @@
                     }
 
                     cleanerLog(`[WORK] PickWorkScreen ready: ${text}`);
-
-                    if (text === "All work here is finished") {
-                        if (crashRecoveryState.recoveryInProgress) {
-                            cleanerLog(`[AVA RECOVERY] Recovered zone ${mapId} is already finished; skipping`);
-                            finishCrashRecovery();
-                        }
-                        this._skipCurrentWorkArea(
-                            mapId,
-                            `[WORK] Zone already completed, skipping: ${mapId}`
-                        );
-                        return;
-                    }
 
                     if (crashRecoveryState.recoveryInProgress) {
                         cleanerLog("[AVA RECOVERY] Work screen loaded");
