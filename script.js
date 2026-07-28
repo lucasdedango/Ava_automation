@@ -28,6 +28,7 @@
     const HEARTBEAT_REQUIRED_TIMEOUT_CHECKS = 2;
     const RECOVERY_STORAGE_KEY = "__AVA_CRASH_RECOVERY_V1__";
     const RECOVERY_RELOAD_HISTORY_KEY = "__AVA_CRASH_RELOAD_HISTORY_V1__";
+    const HOUSE_STORAGE_KEY = "__AVA_SAVED_HOUSE_V1__";
     const RECOVERY_SCHEMA_VERSION = 1;
     const RECOVERY_TTL_MS = 10 * 60 * 1000;
     const RECOVERY_MAX_RELOADS = 3;
@@ -446,6 +447,8 @@
         destinationIds: [],
         destinationCommandsReady: false,
         destinationMenuReady: false,
+        houseInfo: null,
+        houseInfoLoaded: false,
 
         /*
          * Capture des objets métier SERVICE_OBJECT
@@ -1203,6 +1206,340 @@
         }
     }
 
+    function getHouseLocationClass() {
+        try {
+            const city =
+                w.penzville?.city ??
+                null;
+
+            if (!city) {
+                return null;
+            }
+
+            const currentLocation =
+                safeReadProperty(
+                    safeReadProperty(city, "Context"),
+                    "currentLocation"
+                );
+            const currentOwnerId =
+                safeReadProperty(currentLocation, "_gl");
+            const currentSwitchRoom =
+                safeReadProperty(currentLocation, "switchRoom");
+            const currentConstructor =
+                safeReadProperty(currentLocation, "constructor");
+
+            if (
+                currentOwnerId != null &&
+                typeof currentSwitchRoom === "function" &&
+                typeof currentConstructor === "function"
+            ) {
+                return currentConstructor;
+            }
+
+            const readPath = path => {
+                let value = city;
+                for (const name of path) {
+                    value = safeReadProperty(value, name);
+                    if (value == null) {
+                        return null;
+                    }
+                }
+                return value;
+            };
+
+            const directCandidates = [
+                readPath(["HouseLocation"]),
+                readPath(["location", "HouseLocation"]),
+                readPath(["locations", "HouseLocation"]),
+                readPath(["house", "HouseLocation"]),
+                readPath(["model", "HouseLocation"])
+            ];
+
+            for (const candidate of directCandidates) {
+                if (typeof candidate === "function") {
+                    return candidate;
+                }
+            }
+
+            const queue = [{ value: city, depth: 0 }];
+            const seen = new WeakSet();
+            let inspected = 0;
+
+            while (queue.length > 0 && inspected < 1000) {
+                const { value, depth } = queue.shift();
+                if (
+                    !value ||
+                    (typeof value !== "object" && typeof value !== "function") ||
+                    seen.has(value)
+                ) {
+                    continue;
+                }
+
+                seen.add(value);
+                inspected++;
+
+                let names = [];
+                try {
+                    names = Object.getOwnPropertyNames(value).slice(0, 150);
+                } catch {}
+
+                for (const name of names) {
+                    const child = safeReadProperty(value, name);
+
+                    if (name === "HouseLocation" && typeof child === "function") {
+                        return child;
+                    }
+
+                    if (
+                        depth < 3 &&
+                        child &&
+                        (typeof child === "object" || typeof child === "function")
+                    ) {
+                        queue.push({ value: child, depth: depth + 1 });
+                    }
+                }
+            }
+
+            return null;
+        } catch {
+            return null;
+        }
+    }
+
+    function normalizeHouseInfo(value) {
+        if (!value || value.ownerId == null || value.ownerId === "") {
+            return null;
+        }
+
+        return {
+            ownerId: value.ownerId,
+            roomId: value.roomId ?? null,
+            roomKey: value.roomKey ?? null
+        };
+    }
+
+    function currentHouseInfo() {
+        try {
+            const location =
+                w.penzville?.city?.Context?.currentLocation ??
+                null;
+
+            if (
+                !location ||
+                location._gl == null ||
+                location.Lmc == null ||
+                typeof location.switchRoom !== "function"
+            ) {
+                return null;
+            }
+
+            return normalizeHouseInfo({
+                ownerId: location._gl,
+                roomId: location.Lmc ?? null,
+                roomKey: location.qmc ?? null
+            });
+        } catch {
+            return null;
+        }
+    }
+
+    function saveCurrentHouseInfo() {
+        if (state.houseInfo) {
+            return state.houseInfo;
+        }
+
+        const info =
+            currentHouseInfo();
+
+        if (!info) {
+            return null;
+        }
+
+        state.houseInfo = info;
+        gmWrite(HOUSE_STORAGE_KEY, info);
+        console.log("[AVA HOUSE] Player house saved", info);
+        return info;
+    }
+
+    function waitForHouseState(predicate, timeoutMs = 30000, pollMs = 250) {
+        const startedAt =
+            performance.now();
+
+        return new Promise(resolve => {
+            const check = () => {
+                try {
+                    const result = predicate();
+                    if (result) {
+                        resolve(result);
+                        return;
+                    }
+                } catch {}
+
+                if (performance.now() - startedAt >= timeoutMs) {
+                    resolve(null);
+                    return;
+                }
+
+                setTimeout(check, pollMs);
+            };
+
+            check();
+        });
+    }
+
+    function houseLocationIsActive(location, ownerId) {
+        try {
+            const current =
+                w.penzville?.city?.Context?.currentLocation ??
+                null;
+
+            return Boolean(
+                current &&
+                (
+                    current === location ||
+                    (
+                        current._gl != null &&
+                        String(current._gl) === String(ownerId)
+                    )
+                )
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    async function goHouse(ownerId, roomId = null) {
+        if (ownerId == null || ownerId === "") {
+            console.error("[AVA HOUSE] Invalid ownerId");
+            return false;
+        }
+
+        saveCurrentHouseInfo();
+
+        const HouseLocation =
+            getHouseLocationClass();
+
+        if (!HouseLocation) {
+            console.error("[AVA HOUSE] HouseLocation unavailable");
+            return false;
+        }
+
+        let location = null;
+
+        try {
+            location = new HouseLocation(ownerId, null);
+            w.penzville.city.Context.currentLocation = location;
+            console.log(`[AVA HOUSE] Teleporting to house ${String(ownerId)}`);
+        } catch (error) {
+            console.error("[AVA HOUSE] House teleport failed", error);
+            return false;
+        }
+
+        let activeSince = 0;
+        const activeLocation = await waitForHouseState(() => {
+            if (!houseLocationIsActive(location, ownerId)) {
+                activeSince = 0;
+                return null;
+            }
+
+            if (!activeSince) {
+                activeSince = performance.now();
+                return null;
+            }
+
+            if (performance.now() - activeSince < 750) {
+                return null;
+            }
+
+            return w.penzville?.city?.Context?.currentLocation ?? null;
+        });
+
+        if (!activeLocation) {
+            console.error("[AVA HOUSE] House activation timeout");
+            return false;
+        }
+
+        if (roomId == null || roomId === "") {
+            return {
+                success: true,
+                ownerId,
+                roomId: null,
+                roomSwitched: false
+            };
+        }
+
+        try {
+            if (typeof activeLocation.switchRoom !== "function") {
+                console.error("[AVA HOUSE] switchRoom unavailable; remaining in house");
+                return {
+                    success: true,
+                    ownerId,
+                    roomId,
+                    roomSwitched: false
+                };
+            }
+
+            activeLocation.switchRoom(roomId);
+            console.log(`[AVA HOUSE] Switching to room ${String(roomId)}`);
+        } catch (error) {
+            console.error("[AVA HOUSE] Room switch failed; remaining in house", error);
+            return {
+                success: true,
+                ownerId,
+                roomId,
+                roomSwitched: false
+            };
+        }
+
+        let roomReadySince = 0;
+        const roomReady = await waitForHouseState(() => {
+            if (!houseLocationIsActive(location, ownerId)) {
+                roomReadySince = 0;
+                return null;
+            }
+
+            const current =
+                w.penzville?.city?.Context?.currentLocation ??
+                null;
+
+            if (String(current?.Lmc ?? "") !== String(roomId)) {
+                roomReadySince = 0;
+                return null;
+            }
+
+            if (!roomReadySince) {
+                roomReadySince = performance.now();
+                return null;
+            }
+
+            if (performance.now() - roomReadySince < 750) {
+                return null;
+            }
+
+            return current;
+        });
+
+        if (!roomReady) {
+            console.error(
+                `[AVA HOUSE] Room ${String(roomId)} load timeout; remaining in house`
+            );
+            return {
+                success: true,
+                ownerId,
+                roomId,
+                roomSwitched: false
+            };
+        }
+
+        console.log(`[AVA HOUSE] Room ${String(roomId)} ready`);
+        return {
+            success: true,
+            ownerId,
+            roomId,
+            roomSwitched: true
+        };
+    }
+
     function getDestinationRegistry() {
         try {
             return getWorkManager()?.FYl ?? null;
@@ -1384,6 +1721,7 @@
         }
 
         try {
+            saveCurrentHouseInfo();
             w.penzville.city.Context.currentLocation =
                 new WorkLocation(stringId);
 
@@ -1396,6 +1734,35 @@
 
             return false;
         }
+    };
+
+    w.__AVA_GO_HOUSE__ = function (ownerId, roomId = null) {
+        return goHouse(ownerId, roomId);
+    };
+
+    w.__AVA_RETURN_HOME__ = async function () {
+        let currentInfo =
+            saveCurrentHouseInfo();
+
+        if (!currentInfo && !state.houseInfoLoaded) {
+            await waitForHouseState(
+                () => state.houseInfoLoaded || null,
+                5000,
+                100
+            );
+            currentInfo = saveCurrentHouseInfo();
+        }
+
+        const info = currentInfo ?? state.houseInfo;
+
+        if (!info) {
+            console.error(
+                "[AVA HOUSE] Player house is not saved yet; visit the house once before using __AVA_RETURN_HOME__()"
+            );
+            return false;
+        }
+
+        return goHouse(info.ownerId, info.roomId);
     };
 
     w.__AVA_LIST_DESTINATIONS__ = function () {
@@ -1440,6 +1807,37 @@
                     "[AVA-V12] Destination system ready"
                 );
             }, 500);
+    }
+
+    async function initializeHouseSystem() {
+        const current =
+            saveCurrentHouseInfo();
+
+        if (!current) {
+            const stored =
+                normalizeHouseInfo(
+                    await gmRead(HOUSE_STORAGE_KEY, null)
+                );
+
+            if (stored && !state.houseInfo) {
+                state.houseInfo = stored;
+                console.log("[AVA HOUSE] Saved house restored", stored);
+            }
+        }
+
+        state.houseInfoLoaded = true;
+
+        if (state.houseInfo) {
+            return state.houseInfo;
+        }
+
+        const timer = setInterval(() => {
+            if (saveCurrentHouseInfo()) {
+                clearInterval(timer);
+            }
+        }, 500);
+
+        return null;
     }
 
     /*
@@ -7133,7 +7531,7 @@
             },
             {
                 section: "Destination commands",
-                commands: "__AVA_LIST_DESTINATIONS__, __AVA_GO_WORK__, __AVA_GO_<DESTINATION>__, __AVA_GO_YARD__, __AVA_GO_GARDEN__, __AVA_GO_RESTAURANT__, __AVA_GO_SCULPT__, __AVA_GO_SCHOOL__, __AVA_GO_NPC_HOUSE__, __AVA_GO_FORTUNE__, __AVA_GO_FORTUNE2__, __AVA_GO_FORTUNE3__"
+                commands: "__AVA_LIST_DESTINATIONS__, __AVA_GO_WORK__, __AVA_GO_HOUSE__, __AVA_RETURN_HOME__, __AVA_GO_<DESTINATION>__, __AVA_GO_YARD__, __AVA_GO_GARDEN__, __AVA_GO_RESTAURANT__, __AVA_GO_SCULPT__, __AVA_GO_SCHOOL__, __AVA_GO_NPC_HOUSE__, __AVA_GO_FORTUNE__, __AVA_GO_FORTUNE2__, __AVA_GO_FORTUNE3__"
             },
             {
                 section: "Action capture",
@@ -7239,6 +7637,11 @@
                 destinationMenuReady:
                     state.destinationMenuReady,
 
+                savedHouse:
+                    state.houseInfo
+                        ? { ...state.houseInfo }
+                        : null,
+
                 mapCleanerRunning:
                     w.__AVA_MAP_CLEANER__?.running ??
                     false,
@@ -7330,6 +7733,7 @@
         };
 
     initializeDestinationSystem();
+    initializeHouseSystem();
     initializeMapCleaner();
     installMapCleanerWhenReady();
     initializeAutoCleanLoop();
