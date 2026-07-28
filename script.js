@@ -29,6 +29,9 @@
     const RECOVERY_STORAGE_KEY = "__AVA_CRASH_RECOVERY_V1__";
     const RECOVERY_RELOAD_HISTORY_KEY = "__AVA_CRASH_RELOAD_HISTORY_V1__";
     const HOUSE_STORAGE_KEY = "__AVA_SAVED_HOUSE_V1__";
+    const HOME_OWNER_ID = "921180938";
+    const HOME_ROOM_ID = "room4";
+    const FRIDGE_COOLDOWN_SECONDS = 3 * 60 * 60;
     const RECOVERY_SCHEMA_VERSION = 1;
     const RECOVERY_TTL_MS = 10 * 60 * 1000;
     const RECOVERY_MAX_RELOADS = 3;
@@ -280,6 +283,15 @@
         lastRecoveryError: null,
         lastCheckpointWriteAt: 0
     };
+    const energyRecoveryState = {
+        inProgress: false,
+        phase: "idle",
+        savedWork: null,
+        requestedCount: 2,
+        eatenCount: 0,
+        retryAfter: 0,
+        lastError: null
+    };
 
     function serializableEntries(value) {
         try {
@@ -322,6 +334,17 @@
                 skippedObjectIds: serializableEntries(cleaner?._skippedObjects),
                 inactiveObjectIds: serializableEntries(cleaner?._inactiveObjects),
                 attemptEntries: serializableEntries(cleaner?._attempts)
+            },
+            energyRecovery: {
+                inProgress: energyRecoveryState.inProgress,
+                phase: energyRecoveryState.phase,
+                savedWork: energyRecoveryState.savedWork
+                    ? { ...energyRecoveryState.savedWork }
+                    : null,
+                requestedCount: energyRecoveryState.requestedCount,
+                eatenCount: energyRecoveryState.eatenCount,
+                retryAfter: energyRecoveryState.retryAfter,
+                lastError: energyRecoveryState.lastError
             }
         };
     }
@@ -1540,6 +1563,422 @@
         };
     }
 
+    function fridgeRow(model) {
+        try {
+            if (String(model?.shopItem?.typeId ?? "") !== "refrigerator3") {
+                return null;
+            }
+
+            const objectId =
+                model.objectId ??
+                null;
+
+            if (objectId == null) {
+                return null;
+            }
+
+            const now =
+                Math.floor(Date.now() / 1000);
+            const lastProductionTime =
+                Number(model.lastProductionTime ?? 0);
+            const elapsed =
+                Math.max(0, now - lastProductionTime);
+            const remainingSeconds =
+                Math.max(0, FRIDGE_COOLDOWN_SECONDS - elapsed);
+
+            return {
+                objectId: String(objectId),
+                typeId: "refrigerator3",
+                model,
+                lastProductionTime,
+                eaterId: model.eaterId ?? null,
+                ready: remainingSeconds === 0,
+                remainingSeconds
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    function findFridgesInCurrentRoom() {
+        const location =
+            w.penzville?.city?.Context?.currentLocation ??
+            null;
+
+        if (!location) {
+            return [];
+        }
+
+        const roots = [
+            location,
+            safeReadProperty(location, "_h"),
+            safeReadProperty(safeReadProperty(location, "_h"), "Jql"),
+            safeReadProperty(location, "roomLayout"),
+            safeReadProperty(location, "world")
+        ].filter(Boolean);
+        const queue = roots.map(value => ({ value, depth: 0 }));
+        const seen = new WeakSet();
+        const byObjectId = new Map();
+        let inspected = 0;
+
+        while (queue.length > 0 && inspected < 10000) {
+            const { value, depth } = queue.shift();
+            if (
+                !value ||
+                (typeof value !== "object" && typeof value !== "function") ||
+                seen.has(value)
+            ) {
+                continue;
+            }
+
+            seen.add(value);
+            inspected++;
+
+            const row = fridgeRow(value);
+            if (row && !byObjectId.has(row.objectId)) {
+                byObjectId.set(row.objectId, row);
+            }
+
+            if (depth >= 7) {
+                continue;
+            }
+
+            if (Array.isArray(value)) {
+                for (const child of value.slice(0, 500)) {
+                    if (child && typeof child === "object") {
+                        queue.push({ value: child, depth: depth + 1 });
+                    }
+                }
+                continue;
+            }
+
+            let names = [];
+            try {
+                names = Object.getOwnPropertyNames(value).slice(0, 120);
+            } catch {}
+
+            for (const name of names) {
+                if (["parent", "stage", "graphics"].includes(name)) {
+                    continue;
+                }
+                const child = safeReadProperty(value, name);
+                if (child && typeof child === "object") {
+                    queue.push({ value: child, depth: depth + 1 });
+                }
+            }
+        }
+
+        return [...byObjectId.values()].sort((left, right) =>
+            Number(right.ready) - Number(left.ready) ||
+            left.remainingSeconds - right.remainingSeconds
+        );
+    }
+
+    function findRoomActionManager() {
+        const location =
+            w.penzville?.city?.Context?.currentLocation ??
+            null;
+
+        if (!location) {
+            return null;
+        }
+
+        const context =
+            w.penzville?.city?.Context ??
+            null;
+        const roots = [
+            location,
+            safeReadProperty(location, "_h"),
+            safeReadProperty(location, "roomLayout"),
+            safeReadProperty(context, "roomActionNetManager"),
+            safeReadProperty(context, "J")
+        ].filter(Boolean);
+        const queue = roots.map(value => ({ value, depth: 0 }));
+        const seen = new WeakSet();
+        let inspected = 0;
+
+        while (queue.length > 0 && inspected < 3000) {
+            const { value, depth } = queue.shift();
+            if (!value || typeof value !== "object" || seen.has(value)) {
+                continue;
+            }
+            seen.add(value);
+            inspected++;
+
+            if (
+                typeof value.startAction === "function" &&
+                typeof value.finishAction === "function"
+            ) {
+                return value;
+            }
+
+            if (depth >= 5) {
+                continue;
+            }
+
+            let names = [];
+            try {
+                names = Object.getOwnPropertyNames(value).slice(0, 120);
+            } catch {}
+
+            for (const name of names) {
+                if (["parent", "stage", "graphics"].includes(name)) {
+                    continue;
+                }
+                const child = safeReadProperty(value, name);
+                if (child && typeof child === "object") {
+                    queue.push({ value: child, depth: depth + 1 });
+                }
+            }
+        }
+
+        return null;
+    }
+
+    function roomActionEventMatches(event, objectId) {
+        try {
+            const values = [
+                event?.objectId,
+                event?.data?.objectId,
+                event?.params?.objectId,
+                event?.targetObjectId
+            ].filter(value => value != null).map(String);
+            const actions = [
+                event?.action,
+                event?.data?.action,
+                event?.params?.action,
+                event?.actionId
+            ].filter(value => value != null).map(String);
+
+            return (
+                (values.length === 0 || values.includes(String(objectId))) &&
+                (actions.length === 0 || actions.includes("use"))
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function watchRoomActionEvents(manager, objectId) {
+        let started = false;
+        let finished = false;
+        const removers = [];
+        const targets = [
+            manager,
+            w.penzville?.city?.Context?.currentLocation
+        ].filter(Boolean);
+        const eventTypes = new Set([
+            "roomActionStarted",
+            "ROOM_ACTION_STARTED",
+            "roomActionFinished",
+            "ROOM_ACTION_FINISHED"
+        ]);
+
+        for (const source of [manager, manager?.constructor]) {
+            let names = [];
+            try {
+                names = Object.getOwnPropertyNames(source ?? {});
+            } catch {}
+            for (const name of names) {
+                if (!/(start|finish)/i.test(name)) {
+                    continue;
+                }
+                const value = safeReadProperty(source, name);
+                if (typeof value === "string" && /action/i.test(value)) {
+                    eventTypes.add(value);
+                }
+            }
+        }
+
+        for (const target of targets) {
+            if (typeof target.addEventListener !== "function") {
+                continue;
+            }
+            for (const type of eventTypes) {
+                const listener = event => {
+                    if (!roomActionEventMatches(event, objectId)) {
+                        return;
+                    }
+                    if (/finished/i.test(type)) {
+                        finished = true;
+                    } else {
+                        started = true;
+                    }
+                };
+                try {
+                    target.addEventListener(type, listener);
+                    removers.push(() => {
+                        try {
+                            target.removeEventListener(type, listener);
+                        } catch {}
+                    });
+                } catch {}
+            }
+        }
+
+        return {
+            get started() { return started; },
+            get finished() { return finished; },
+            cleanup() {
+                for (const remove of removers) {
+                    remove();
+                }
+            }
+        };
+    }
+
+    async function eatFromFridge(objectId) {
+        const row =
+            findFridgesInCurrentRoom()
+                .find(item => item.objectId === String(objectId));
+
+        if (!row) {
+            return { success: false, objectId: String(objectId), reason: "fridge not found" };
+        }
+        if (!row.ready) {
+            return { success: false, objectId: row.objectId, reason: "fridge cooldown active" };
+        }
+
+        const manager =
+            findRoomActionManager();
+        if (!manager) {
+            return { success: false, objectId: row.objectId, reason: "RoomActionNetManager unavailable" };
+        }
+
+        const avatarId =
+            HOME_OWNER_ID;
+        const previousTimestamp =
+            Number(row.model.lastProductionTime ?? 0);
+        const events =
+            watchRoomActionEvents(manager, row.objectId);
+
+        try {
+            try {
+                if (typeof row.model.select === "function") {
+                    row.model.select();
+                }
+            } catch {}
+
+            const point = getObjectPoint(row.model);
+            if (point && typeof w.__AVA_WALK_TO__ === "function") {
+                w.__AVA_WALK_TO__(point.x, point.y);
+                await new Promise(resolve => setTimeout(resolve, 750));
+            }
+
+            const refreshed = fridgeRow(row.model);
+            if (!refreshed?.ready) {
+                return { success: false, objectId: row.objectId, reason: "fridge became unavailable" };
+            }
+
+            console.log(`[AVA FRIDGE] Using ${row.objectId}`);
+            const startResult = manager.startAction(
+                row.objectId,
+                "use",
+                avatarId,
+                null
+            );
+            if (startResult === false) {
+                return { success: false, objectId: row.objectId, reason: "start action rejected" };
+            }
+
+            const started = await waitForHouseState(() =>
+                events.started ||
+                Number(row.model.lastProductionTime ?? 0) > previousTimestamp,
+                8000,
+                100
+            );
+            if (!started) {
+                return { success: false, objectId: row.objectId, reason: "roomActionStarted timeout" };
+            }
+
+            const finishResult = manager.finishAction(
+                row.objectId,
+                "use",
+                avatarId,
+                null
+            );
+            if (finishResult === false) {
+                return { success: false, objectId: row.objectId, reason: "finish action rejected" };
+            }
+
+            const completed = await waitForHouseState(() =>
+                Number(row.model.lastProductionTime ?? 0) > previousTimestamp ||
+                events.finished,
+                15000,
+                100
+            );
+
+            if (!completed) {
+                return { success: false, objectId: row.objectId, reason: "roomActionFinished timeout" };
+            }
+
+            console.log("[AVA FRIDGE] Use succeeded; lastProductionTime updated");
+            return {
+                success: true,
+                objectId: row.objectId,
+                previousTimestamp,
+                lastProductionTime: Number(row.model.lastProductionTime ?? previousTimestamp),
+                confirmedBy: Number(row.model.lastProductionTime ?? 0) > previousTimestamp
+                    ? "lastProductionTime"
+                    : "roomActionFinished"
+            };
+        } catch (error) {
+            return {
+                success: false,
+                objectId: row.objectId,
+                reason: String(error)
+            };
+        } finally {
+            events.cleanup();
+            try {
+                if (typeof row.model.deselect === "function") {
+                    row.model.deselect();
+                }
+            } catch {}
+        }
+    }
+
+    async function eatAvailable(count = 1) {
+        const requested =
+            Math.max(0, Math.floor(Number(count) || 0));
+        const rows =
+            findFridgesInCurrentRoom();
+        const ready =
+            rows.filter(row => row.ready);
+        const result = {
+            requested,
+            eaten: 0,
+            attemptedObjectIds: [],
+            successfulObjectIds: [],
+            failures: [],
+            readyFound: ready.length,
+            nextReadyInSeconds: rows.length
+                ? Math.min(...rows.map(row => row.remainingSeconds))
+                : null
+        };
+
+        console.log(`[AVA FRIDGE] Found ${rows.length} refrigerators, ${ready.length} ready`);
+
+        for (const row of ready.slice(0, requested)) {
+            result.attemptedObjectIds.push(row.objectId);
+            const attempt = await eatFromFridge(row.objectId);
+            if (attempt.success) {
+                result.eaten++;
+                result.successfulObjectIds.push(row.objectId);
+            } else {
+                result.failures.push(attempt);
+            }
+        }
+
+        if (result.eaten < requested) {
+            result.failures.push({
+                reason: `only ${result.eaten}/${requested} refrigerator uses succeeded`
+            });
+        }
+
+        return result;
+    }
+
     function getDestinationRegistry() {
         try {
             return getWorkManager()?.FYl ?? null;
@@ -1765,6 +2204,26 @@
         return goHouse(info.ownerId, info.roomId);
     };
 
+    w.__AVA_LIST_FRIDGES__ = function () {
+        const rows = findFridgesInCurrentRoom();
+        const displayRows = rows.map(row => ({
+            objectId: row.objectId,
+            ready: row.ready,
+            lastUse: row.lastProductionTime,
+            remainingMinutes: Math.ceil(row.remainingSeconds / 60)
+        }));
+        console.table(displayRows);
+        return rows;
+    };
+
+    w.__AVA_EAT_FROM_FRIDGE__ = function (objectId) {
+        return eatFromFridge(objectId);
+    };
+
+    w.__AVA_EAT_AVAILABLE__ = function (count = 1) {
+        return eatAvailable(count);
+    };
+
     w.__AVA_LIST_DESTINATIONS__ = function () {
         const ids =
             getDestinationIds() ??
@@ -1838,6 +2297,222 @@
         }, 500);
 
         return null;
+    }
+
+    function serializableInterruptedWork(cleaner) {
+        const autoLoop =
+            w.__AVA_AUTO_CLEAN_LOOP__;
+
+        return {
+            currentMap: cleaner.currentMap ?? null,
+            mapIndex: Number(cleaner._mapIndex ?? 0),
+            cycleMode: autoLoop?.cycleMode ?? null,
+            nextCycleMode: autoLoop?.nextCycleMode ?? null,
+            interruptedTargetId: cleaner.currentTarget
+                ? stableObjectId(cleaner.currentTarget)
+                : (cleaner._energyInterruptedTargetId ?? null)
+        };
+    }
+
+    function markEnergyRecoveryFailed(cleaner, reason, retryAfter = 0) {
+        energyRecoveryState.inProgress = false;
+        energyRecoveryState.phase = "paused";
+        energyRecoveryState.lastError = reason;
+        energyRecoveryState.retryAfter = retryAfter;
+        cleaner.paused = true;
+        cleaner.pauseReason = reason;
+
+        const autoLoop =
+            w.__AVA_AUTO_CLEAN_LOOP__;
+        if (autoLoop) {
+            autoLoop.running = false;
+            autoLoop.phase = reason;
+            autoLoop.energyRecoveryInProgress = false;
+        }
+
+        console.error(`[AVA ENERGY] Recovery paused: ${reason}`);
+        requestRecoveryCheckpointSave("energy-recovery-paused", true);
+        return false;
+    }
+
+    async function waitForWorkReturn(mapId, cleaner) {
+        return waitForHouseState(() => {
+            if (!gameLooksPlayable()) {
+                return null;
+            }
+
+            const id =
+                currentMapId();
+            if (id != null && String(id) === String(mapId)) {
+                return true;
+            }
+
+            try {
+                if (discoverCleanableObjects(cleaner.config).length > 0) {
+                    return true;
+                }
+            } catch {}
+
+            return null;
+        }, cleaner.config.mapLoadTimeout ?? 30000, 500);
+    }
+
+    async function startEnergyRecovery(cleaner, energy = null, restoredState = null) {
+        if (energyRecoveryState.inProgress) {
+            return false;
+        }
+
+        const savedWork =
+            restoredState?.savedWork ??
+            serializableInterruptedWork(cleaner);
+
+        if (!savedWork.currentMap) {
+            return markEnergyRecoveryFailed(cleaner, "energy-recovery-missing-work-map");
+        }
+
+        energyRecoveryState.inProgress = true;
+        energyRecoveryState.phase = "going-home";
+        energyRecoveryState.savedWork = { ...savedWork };
+        energyRecoveryState.requestedCount = Number(restoredState?.requestedCount ?? 2);
+        energyRecoveryState.eatenCount = Number(restoredState?.eatenCount ?? 0);
+        energyRecoveryState.retryAfter = 0;
+        energyRecoveryState.lastError = null;
+
+        cleaner.paused = true;
+        cleaner.pauseReason = "energy-recovery";
+        cleaner._clearTimers();
+        cleaner.busy = false;
+        cleaner.currentTarget = null;
+        cleaner._activeAction = null;
+        cleaner._lastScanTargets = [];
+        cleaner._recoveryTargetId = savedWork.interruptedTargetId ?? null;
+        cleaner._energyInterruptedTargetId = null;
+
+        const autoLoop =
+            w.__AVA_AUTO_CLEAN_LOOP__;
+        if (autoLoop) {
+            autoLoop.phase = "energy-recovery";
+            autoLoop.energyRecoveryInProgress = true;
+        }
+
+        console.warn(`[AVA ENERGY] Energy below threshold: ${formatEnergy(energy)}`);
+        console.log(`[AVA ENERGY] Saving interrupted work: ${savedWork.currentMap}`);
+        requestRecoveryCheckpointSave("energy-recovery-start", true);
+
+        console.log(`[AVA HOUSE] Going home: ${HOME_OWNER_ID}`);
+        const homeResult =
+            await goHouse(HOME_OWNER_ID, HOME_ROOM_ID);
+
+        if (!homeResult || homeResult.roomSwitched !== true) {
+            return markEnergyRecoveryFailed(cleaner, "house-or-room-timeout");
+        }
+
+        energyRecoveryState.phase = "eating";
+        const remainingCount = Math.max(
+            0,
+            energyRecoveryState.requestedCount - energyRecoveryState.eatenCount
+        );
+        const eatResult =
+            await eatAvailable(remainingCount);
+        energyRecoveryState.eatenCount += eatResult.eaten;
+
+        console.log(
+            `[AVA ENERGY] Ate successfully ${energyRecoveryState.eatenCount}/${energyRecoveryState.requestedCount} times`
+        );
+
+        try {
+            cleaner.refreshEnergyField();
+        } catch {}
+        const currentEnergy =
+            cleaner.getEnergy();
+        if (currentEnergy) {
+            console.log(`[AVA ENERGY] Current energy: ${formatEnergy(currentEnergy)}`);
+        }
+
+        if (
+            energyRecoveryState.eatenCount < energyRecoveryState.requestedCount &&
+            (!currentEnergy || currentEnergy.current < MIN_ENERGY_TO_ACT)
+        ) {
+            const fallbackSeconds = 30 * 60;
+            const waitSeconds = Math.max(
+                60,
+                Number(eatResult.nextReadyInSeconds ?? fallbackSeconds)
+            );
+            return markEnergyRecoveryFailed(
+                cleaner,
+                "insufficient-ready-fridges",
+                Date.now() + waitSeconds * 1000
+            );
+        }
+
+        if (currentEnergy && currentEnergy.current < MIN_ENERGY_TO_ACT) {
+            return markEnergyRecoveryFailed(
+                cleaner,
+                "energy-still-low-after-eating",
+                Date.now() + 30 * 60 * 1000
+            );
+        }
+
+        energyRecoveryState.phase = "returning-to-work";
+        console.log(`[AVA ENERGY] Returning to ${savedWork.currentMap}`);
+
+        const teleported =
+            w.__AVA_GO_WORK__(savedWork.currentMap);
+        if (!teleported) {
+            return markEnergyRecoveryFailed(cleaner, "work-return-teleport-failed");
+        }
+
+        const returned =
+            await waitForWorkReturn(savedWork.currentMap, cleaner);
+        if (!returned) {
+            return markEnergyRecoveryFailed(cleaner, "work-return-timeout");
+        }
+
+        cleaner.currentMap = savedWork.currentMap;
+        cleaner._mapIndex = savedWork.mapIndex;
+        cleaner.busy = false;
+        cleaner.currentTarget = null;
+        cleaner._activeAction = null;
+        cleaner.paused = false;
+        cleaner.pauseReason = null;
+        cleaner._emptyScans = 0;
+
+        if (autoLoop) {
+            autoLoop.cycleMode = savedWork.cycleMode ?? autoLoop.cycleMode;
+            autoLoop.nextCycleMode = savedWork.nextCycleMode ?? autoLoop.nextCycleMode;
+            autoLoop.running = true;
+            autoLoop.phase = "cleaning";
+            autoLoop.energyRecoveryInProgress = false;
+        }
+
+        energyRecoveryState.inProgress = false;
+        energyRecoveryState.phase = "complete";
+        energyRecoveryState.retryAfter = 0;
+        requestRecoveryCheckpointSave("energy-recovery-complete", true);
+
+        if (isCurrentWorkFinished()) {
+            cleaner._skipCurrentWorkArea(
+                savedWork.currentMap,
+                `[WORK] Zone already completed, skipping: ${savedWork.currentMap}`
+            );
+        } else {
+            cleaner._scheduleScan(0);
+        }
+
+        console.log("[AVA ENERGY] Cleaner resumed");
+        return true;
+    }
+
+    function launchEnergyRecovery(cleaner, energy = null, restoredState = null) {
+        return Promise.resolve()
+            .then(() => startEnergyRecovery(cleaner, energy, restoredState))
+            .catch(error => {
+                console.error("[AVA ENERGY] Unexpected recovery error", error);
+                return markEnergyRecoveryFailed(
+                    cleaner,
+                    `energy-recovery-error: ${String(error)}`
+                );
+            });
     }
 
     /*
@@ -3754,6 +4429,7 @@
             _workAreaNeedsReloadForSkippedObjects: false,
             _recoveryTargetId: null,
             _restoredRecoveryState: null,
+            _energyInterruptedTargetId: null,
 
             start(options = {}) {
                 if (this.running) {
@@ -3789,6 +4465,7 @@
                 this._yardNeedsReloadForSkippedObjects = false;
                 this._workAreaReloadCounts = new Map();
                 this._workAreaNeedsReloadForSkippedObjects = false;
+                this._energyInterruptedTargetId = null;
                 cleanerLog("Started");
                 requestRecoveryCheckpointSave("cleaner-start", true);
                 this._moveToConfiguredMap();
@@ -4137,14 +4814,28 @@
                 return energy;
             },
 
-            _pauseForEnergy(energy = this.getEnergy()) {
+            _pauseForEnergy(energy = this.getEnergy(), target = null) {
                 this.paused = true;
+                this._energyInterruptedTargetId = target
+                    ? stableObjectId(target)
+                    : this._energyInterruptedTargetId;
+                const autoLoop = w.__AVA_AUTO_CLEAN_LOOP__;
+
+                if (autoLoop?.enabled) {
+                    this.pauseReason = "energy-recovery";
+                    cleanerWarn(`Not enough energy: ${formatEnergy(energy)}. Starting home recovery.`);
+                    setTimeout(() => {
+                        launchEnergyRecovery(this, energy);
+                    }, 0);
+                    return false;
+                }
+
                 this.pauseReason = "energy";
                 cleanerWarn(`Not enough energy: ${formatEnergy(energy)}. Bot paused.`);
                 return false;
             },
 
-            _canStartEnergyAction() {
+            _canStartEnergyAction(target = null) {
                 const energy =
                     this._logEnergyBeforeAction();
 
@@ -4152,7 +4843,7 @@
                     energy &&
                     energy.current < MIN_ENERGY_TO_ACT
                 ) {
-                    return this._pauseForEnergy(energy);
+                    return this._pauseForEnergy(energy, target);
                 }
 
                 return true;
@@ -5095,7 +5786,7 @@
                     return false;
                 }
 
-                if (!this._canStartEnergyAction()) {
+                if (!this._canStartEnergyAction(target)) {
                     return false;
                 }
 
@@ -5197,7 +5888,7 @@
                     return false;
                 }
 
-                if (!this._canStartEnergyAction()) {
+                if (!this._canStartEnergyAction(target)) {
                     return false;
                 }
 
@@ -5315,7 +6006,7 @@
                             if (this._skipIfCurrentWorkFinished("butterfly InteractAction creation")) {
                                 return;
                             }
-                            if (!this._canStartEnergyAction()) {
+                            if (!this._canStartEnergyAction(target)) {
                                 this._completeInteraction(token, "energy paused", null);
                                 return;
                             }
@@ -5583,6 +6274,7 @@
             startDelayMs: 3000,
             pollMs: 2000,
             recoveryInProgress: false,
+            energyRecoveryInProgress: false,
             _timers: [],
 
             on() {
@@ -5646,7 +6338,8 @@
                     nextReloadInMs: this.nextReloadAt
                         ? Math.max(0, this.nextReloadAt - Date.now())
                         : null,
-                    recoveryInProgress: this.recoveryInProgress
+                    recoveryInProgress: this.recoveryInProgress,
+                    energyRecoveryInProgress: this.energyRecoveryInProgress
                 };
             },
 
@@ -5809,6 +6502,19 @@
                     return;
                 }
 
+                if (
+                    cleaner.paused &&
+                    [
+                        "insufficient-ready-fridges",
+                        "energy-still-low-after-eating",
+                        "house-or-room-timeout",
+                        "work-return-teleport-failed",
+                        "work-return-timeout"
+                    ].includes(cleaner.pauseReason)
+                ) {
+                    return;
+                }
+
                 if (cleaner.running || cleaner.busy) {
                     this._setTimer(() => this._watchCleaner(), this.pollMs);
                     return;
@@ -5950,6 +6656,28 @@
                     autoLoop.maps = checkpoint.autoLoop.maps.slice();
                     autoLoop.phase = "recovering";
                     crashRecoveryState.phase = "teleporting";
+
+                    if (checkpoint.energyRecovery?.inProgress) {
+                        const cleaner = w.__AVA_MAP_CLEANER__;
+                        cleaner.running = true;
+                        cleaner.paused = true;
+                        cleaner.pauseReason = "energy-recovery";
+                        cleaner.config.maps = checkpoint.autoLoop.maps.slice();
+                        cleaner._mapIndex = Number(checkpoint.autoLoop.mapIndex ?? 0);
+                        cleaner.currentMap = checkpoint.energyRecovery.savedWork?.currentMap ?? checkpoint.cleaner.currentMap;
+                        autoLoop.recoveryInProgress = false;
+                        autoLoop.energyRecoveryInProgress = true;
+                        crashRecoveryState.recoveryInProgress = false;
+                        crashRecoveryState.phase = "energy-recovery";
+                        launchEnergyRecovery(
+                            cleaner,
+                            null,
+                            checkpoint.energyRecovery
+                        );
+                        resolve(true);
+                        return;
+                    }
+
                     const resumed = w.__AVA_MAP_CLEANER__.resumeFromRecovery(checkpoint);
                     if (!resumed) {
                         crashRecoveryState.lastRecoveryError = "cleaner refused recovery checkpoint";
@@ -7534,6 +8262,10 @@
                 commands: "__AVA_LIST_DESTINATIONS__, __AVA_GO_WORK__, __AVA_GO_HOUSE__, __AVA_RETURN_HOME__, __AVA_GO_<DESTINATION>__, __AVA_GO_YARD__, __AVA_GO_GARDEN__, __AVA_GO_RESTAURANT__, __AVA_GO_SCULPT__, __AVA_GO_SCHOOL__, __AVA_GO_NPC_HOUSE__, __AVA_GO_FORTUNE__, __AVA_GO_FORTUNE2__, __AVA_GO_FORTUNE3__"
             },
             {
+                section: "Refrigerators",
+                commands: "__AVA_LIST_FRIDGES__, __AVA_EAT_FROM_FRIDGE__, __AVA_EAT_AVAILABLE__"
+            },
+            {
                 section: "Action capture",
                 commands: "__AVA_ACTION_START__, __AVA_ACTION_STOP__, __AVA_ACTION_LIST__, __AVA_ACTION_SHOW__, __AVA_ACTION_TEST__"
             },
@@ -7642,6 +8374,17 @@
                         ? { ...state.houseInfo }
                         : null,
 
+                energyRecovery:
+                    {
+                        inProgress: energyRecoveryState.inProgress,
+                        phase: energyRecoveryState.phase,
+                        savedWork: energyRecoveryState.savedWork,
+                        eatenCount: energyRecoveryState.eatenCount,
+                        requestedCount: energyRecoveryState.requestedCount,
+                        retryAfter: energyRecoveryState.retryAfter,
+                        lastError: energyRecoveryState.lastError
+                    },
+
                 mapCleanerRunning:
                     w.__AVA_MAP_CLEANER__?.running ??
                     false,
@@ -7747,7 +8490,16 @@
             targetMap: crashRecoveryState.targetMap,
             interruptedTargetId: crashRecoveryState.interruptedTargetId,
             phase: crashRecoveryState.phase,
-            lastRecoveryError: crashRecoveryState.lastRecoveryError
+            lastRecoveryError: crashRecoveryState.lastRecoveryError,
+            energyRecovery: {
+                inProgress: energyRecoveryState.inProgress,
+                phase: energyRecoveryState.phase,
+                savedWork: energyRecoveryState.savedWork,
+                eatenCount: energyRecoveryState.eatenCount,
+                requestedCount: energyRecoveryState.requestedCount,
+                retryAfter: energyRecoveryState.retryAfter,
+                lastError: energyRecoveryState.lastError
+            }
         };
     };
     startCrashRecoveryIfNeeded().then(recovered => {
