@@ -41,7 +41,8 @@ function loadParentContext() {
     const childWindow = {};
     const frame = {
         src: 'https://cdn-sp.tortugasocial.com/avataria-vk/app/index_js.html',
-        contentWindow: childWindow
+        contentWindow: childWindow,
+        isConnected: true
     };
     const page = {
         top: null,
@@ -113,7 +114,7 @@ test('parent watchdog arms only for a strictly validated heartbeat', () => {
     assert.equal(status.lastInstanceId, 'test-instance');
 });
 
-test('idle crash is deferred until the next cycle without crash recovery', async () => {
+test('idle heartbeat loss reloads immediately without work recovery', async () => {
     const fixture = loadParentContext();
     const idleUntil = 1_060_000;
     fixture.messageListeners[0]({
@@ -133,21 +134,56 @@ test('idle crash is deferred until the next cycle without crash recovery', async
 
     fixture.advance(20_000);
     fixture.intervals[0]();
-    assert.equal(
-        fixture.page.__AVA_CRASH_WATCHDOG_STATUS__().idleReloadDeferredUntil,
-        idleUntil
-    );
+    let status = fixture.page.__AVA_CRASH_WATCHDOG_STATUS__();
+    assert.equal(status.timeoutChecks, 1);
+    assert.equal(status.lastPhase, 'idle');
+    assert.equal(status.lastNextReloadAt, idleUntil);
+    assert.equal(status.frameConnected, true);
     assert.equal(fixture.timeouts.length, 0);
 
-    fixture.advance(41_000);
+    fixture.advance(3_000);
     fixture.intervals[0]();
     await new Promise(resolve => setImmediate(resolve));
     await new Promise(resolve => setImmediate(resolve));
 
+    status = fixture.page.__AVA_CRASH_WATCHDOG_STATUS__();
+    assert.equal(status.lastCrashReason, 'idle-iframe-context-dead');
     const checkpoint = fixture.values.get('__AVA_CRASH_RECOVERY_V1__');
-    assert.equal(checkpoint.reason, 'idle-cycle-due');
+    assert.equal(checkpoint.reason, 'idle-iframe-context-dead');
     assert.equal(checkpoint.recoveryRequested, false);
     assert.equal(fixture.timeouts.length, 1);
     fixture.timeouts[0]();
     assert.equal(fixture.reloadCount(), 1);
+});
+
+test('active heartbeat loss reloads with interrupted-work recovery', async () => {
+    const fixture = loadParentContext();
+    fixture.messageListeners[0]({
+        origin: 'https://cdn-sp.tortugasocial.com',
+        source: fixture.childWindow,
+        data: {
+            type: 'AVA_HEARTBEAT',
+            version: 1,
+            instanceId: 'active-instance',
+            recoverySnapshot: {
+                schemaVersion: 1,
+                autoLoop: { phase: 'cleaning', nextReloadAt: 0 },
+                cleaner: { currentMap: 'garden' }
+            }
+        }
+    });
+
+    fixture.advance(20_000);
+    fixture.intervals[0]();
+    fixture.advance(3_000);
+    fixture.intervals[0]();
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    const status = fixture.page.__AVA_CRASH_WATCHDOG_STATUS__();
+    const checkpoint = fixture.values.get('__AVA_CRASH_RECOVERY_V1__');
+    assert.equal(status.lastCrashReason, 'iframe-heartbeat-timeout');
+    assert.equal(checkpoint.reason, 'iframe-heartbeat-timeout');
+    assert.equal(checkpoint.recoveryRequested, true);
+    assert.equal(fixture.timeouts.length, 1);
 });

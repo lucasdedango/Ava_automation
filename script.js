@@ -115,7 +115,10 @@
             healthySince: 0,
             reloading: false,
             crashReloadCount: 0,
-            idleReloadDeferredUntil: 0
+            lastCrashReason: null,
+            lastPhase: null,
+            lastNextReloadAt: 0,
+            frameConnected: false
         };
 
         async function reloadAfterCrash(options = {}) {
@@ -149,7 +152,7 @@
                 if (recoveryRequested) {
                     console.log(`[AVA RECOVERY] Saved crash checkpoint for map ${checkpoint.cleaner?.currentMap ?? "unknown"}`);
                 } else {
-                    console.log("[AVA HEARTBEAT] Idle period ended; reloading for the next cycle");
+                    console.log("[AVA RECOVERY] Idle game context died; reloading without work recovery");
                 }
             }
 
@@ -168,7 +171,10 @@
             parentState.lastHeartbeatPayload = event.data;
             parentState.lastInstanceId = event.data.instanceId ?? null;
             parentState.timeoutChecks = 0;
-            parentState.idleReloadDeferredUntil = 0;
+            parentState.lastPhase = event.data?.recoverySnapshot?.autoLoop?.phase ?? null;
+            parentState.lastNextReloadAt = Number(
+                event.data?.recoverySnapshot?.autoLoop?.nextReloadAt ?? 0
+            );
             if (!parentState.armed) {
                 parentState.armed = true;
                 parentState.healthySince = now;
@@ -187,8 +193,10 @@
             const frame = findParentGameFrame();
             if (!frame) {
                 parentState.timeoutChecks = 0;
+                parentState.frameConnected = false;
                 return;
             }
+            parentState.frameConnected = Boolean(frame.isConnected);
             const age = Date.now() - parentState.lastHeartbeatAt;
             if (age <= HEARTBEAT_TIMEOUT_MS) {
                 parentState.timeoutChecks = 0;
@@ -196,30 +204,40 @@
             }
             const autoLoopSnapshot =
                 parentState.lastHeartbeatPayload?.recoverySnapshot?.autoLoop;
+            const phase =
+                autoLoopSnapshot?.phase ?? null;
             const idleUntil =
                 Number(autoLoopSnapshot?.nextReloadAt ?? 0);
-            if (autoLoopSnapshot?.phase === "idle" && idleUntil > Date.now()) {
-                parentState.timeoutChecks = 0;
-                if (parentState.idleReloadDeferredUntil !== idleUntil) {
-                    parentState.idleReloadDeferredUntil = idleUntil;
-                    console.warn(
-                        `[AVA HEARTBEAT] Game crashed while idle; reload deferred until ${new Date(idleUntil).toLocaleTimeString()}`
-                    );
-                }
-                return;
-            }
-            if (autoLoopSnapshot?.phase === "idle" && idleUntil > 0) {
-                reloadAfterCrash({
-                    recoveryRequested: false,
-                    reason: "idle-cycle-due"
-                });
-                return;
-            }
+            const idleCrash =
+                phase === "idle";
+            parentState.lastPhase = phase;
+            parentState.lastNextReloadAt = idleUntil;
             parentState.timeoutChecks++;
-            console.warn(`[AVA HEARTBEAT] Heartbeat lost for ${(age / 1000).toFixed(1)}s`);
+            console.warn(
+                `[AVA HEARTBEAT] Heartbeat lost for ${(age / 1000).toFixed(1)}s`,
+                {
+                    phase,
+                    idleUntil,
+                    frameConnected: parentState.frameConnected
+                }
+            );
             if (parentState.timeoutChecks >= HEARTBEAT_REQUIRED_TIMEOUT_CHECKS) {
-                console.error("[AVA HEARTBEAT] Game iframe considered crashed");
-                reloadAfterCrash();
+                const reason = idleCrash
+                    ? "idle-iframe-context-dead"
+                    : "iframe-heartbeat-timeout";
+                parentState.lastCrashReason = reason;
+                console.error(
+                    "[AVA HEARTBEAT] Game context considered dead",
+                    {
+                        reason,
+                        phase,
+                        frameConnected: parentState.frameConnected
+                    }
+                );
+                reloadAfterCrash({
+                    recoveryRequested: !idleCrash,
+                    reason
+                });
             }
         }, HEARTBEAT_WATCHDOG_CHECK_MS);
 
@@ -236,7 +254,11 @@
                 lastInstanceId: parentState.lastInstanceId,
                 timeoutMs: HEARTBEAT_TIMEOUT_MS,
                 crashReloadCount: parentState.crashReloadCount,
-                idleReloadDeferredUntil: parentState.idleReloadDeferredUntil || null,
+                lastCrashReason: parentState.lastCrashReason,
+                lastPhase: parentState.lastPhase,
+                lastNextReloadAt: parentState.lastNextReloadAt || null,
+                frameConnected: Boolean(frame?.isConnected),
+                timeoutChecks: parentState.timeoutChecks,
                 reloadBlocked: parentState.reloadBlocked
             };
         };
