@@ -286,6 +286,9 @@
     const AVA_AUTO_CLEAN_LOOP_ON = false;
     const AVA_AUTO_CLEAN_LOOP_FULL_THEN_YARD_MS = 40 * 60 * 1000;
     const AVA_AUTO_CLEAN_LOOP_YARD_THEN_FULL_MS = 30 * 60 * 1000;
+    const SHIFT_READY_SAFETY_MS = 10 * 1000;
+    const SHIFT_ALIGNMENT_MS = 30 * 1000;
+    const SHIFT_COUNTDOWN_TIMEOUT_MS = 7500;
     const AVA_BUTTERFLY_MAX_ATTEMPTS = 3;
     const AVA_YARD_MAX_RETRIES_PER_OBJECT = 1;
     const AVA_YARD_INTERACTION_TIMEOUT_MS = 40000;
@@ -342,7 +345,8 @@
                 nextCycleMode: autoLoop?.nextCycleMode ?? null,
                 maps: Array.isArray(autoLoop?.maps) ? autoLoop.maps.slice() : [],
                 mapIndex: Number(cleaner?._mapIndex ?? 0),
-                nextReloadAt: Number(autoLoop?.nextReloadAt ?? 0)
+                nextReloadAt: Number(autoLoop?.nextReloadAt ?? 0),
+                mapAvailability: autoLoop?.serializableMapAvailability?.() ?? {}
             },
             cleaner: {
                 running: Boolean(cleaner?.running),
@@ -3535,6 +3539,132 @@
         return result.found;
     }
 
+    function parseShiftCountdown(text) {
+        const normalized = normalizeWorkDisplayText(text);
+        const match = normalized.match(
+            /(?:(\d+):)?(\d{1,2}):(\d{2}) left until the end of this shift/i
+        );
+
+        if (!match) {
+            return null;
+        }
+
+        const hours = Number(match[1] ?? 0);
+        const minutes = Number(match[2]);
+        const seconds = Number(match[3]);
+        if (
+            !Number.isFinite(hours) ||
+            !Number.isFinite(minutes) ||
+            !Number.isFinite(seconds) ||
+            minutes >= 60 ||
+            seconds >= 60
+        ) {
+            return null;
+        }
+
+        return {
+            text: match[0],
+            totalSeconds: hours * 3600 + minutes * 60 + seconds
+        };
+    }
+
+    /*
+     * Shift counters are TextFields, but their private text property differs
+     * between OpenFL builds. Traverse the same two proven display roots as the
+     * work-finished detector and retain the path for runtime diagnostics.
+     */
+    function findVisibleShiftCountdown() {
+        const roots = workDisplayRoots();
+        const stack = roots.map(entry => ({
+            object: entry.object,
+            path: entry.name,
+            visible: true
+        }));
+        const visited = new WeakSet();
+        let visitedNodes = 0;
+
+        while (stack.length > 0 && visitedNodes < 10000) {
+            const entry = stack.pop();
+            const object = entry.object;
+            if (
+                !object ||
+                (typeof object !== "object" && typeof object !== "function") ||
+                visited.has(object)
+            ) {
+                continue;
+            }
+
+            visited.add(object);
+            visitedNodes++;
+            let visible = entry.visible;
+            try {
+                if (object.visible === false || Number(object.alpha) === 0) {
+                    visible = false;
+                }
+            } catch {}
+
+            if (visible) {
+                for (const property of ["text", "__text", "_text", "htmlText", "_htmlText"]) {
+                    let parsed = null;
+                    try {
+                        parsed = parseShiftCountdown(object[property]);
+                    } catch {}
+                    if (parsed) {
+                        const detectedAt = Date.now();
+                        const rawReadyAt = detectedAt + parsed.totalSeconds * 1000;
+                        const readyAt = Math.ceil(
+                            (rawReadyAt + SHIFT_READY_SAFETY_MS) /
+                            SHIFT_ALIGNMENT_MS
+                        ) * SHIFT_ALIGNMENT_MS;
+                        return {
+                            ...parsed,
+                            detectedAt,
+                            rawReadyAt,
+                            readyAt,
+                            path: `${entry.path}.${property}`,
+                            object,
+                            visitedNodes
+                        };
+                    }
+                }
+            }
+
+            let children = null;
+            try {
+                children = object.__children ?? object.children ?? null;
+            } catch {}
+            let childCount = 0;
+            try {
+                childCount = children && typeof children.length === "number"
+                    ? children.length
+                    : (
+                        typeof object.getChildAt === "function"
+                            ? Number(object.numChildren ?? 0)
+                            : 0
+                    );
+            } catch {}
+            if (!Number.isFinite(childCount) || childCount <= 0) {
+                continue;
+            }
+            for (let index = childCount - 1; index >= 0; index--) {
+                try {
+                    const child = children && typeof children.length === "number"
+                        ? children[index]
+                        : object.getChildAt(index);
+                    if (child) {
+                        stack.push({
+                            object: child,
+                            path: `${entry.path}.children[${index}]`,
+                            visible
+                        });
+                    }
+                } catch {}
+            }
+        }
+
+        return null;
+    }
+
     function gameLooksPlayable() {
         try {
             const avatar =
@@ -4452,6 +4582,7 @@
             _recoveryTargetId: null,
             _restoredRecoveryState: null,
             _energyInterruptedTargetId: null,
+            _shiftAdvancePending: false,
 
             start(options = {}) {
                 if (this.running) {
@@ -4488,6 +4619,7 @@
                 this._workAreaReloadCounts = new Map();
                 this._workAreaNeedsReloadForSkippedObjects = false;
                 this._energyInterruptedTargetId = null;
+                this._shiftAdvancePending = false;
                 cleanerLog("Started");
                 requestRecoveryCheckpointSave("cleaner-start", true);
                 this._moveToConfiguredMap();
@@ -4987,6 +5119,9 @@
             },
 
             _skipCurrentWorkArea(mapId, reason) {
+                if (this._shiftAdvancePending) {
+                    return;
+                }
                 const activeTarget = this.currentTarget;
                 this.interactionToken++;
                 this._clearTimers();
@@ -4998,10 +5133,38 @@
                 this.busy = false;
                 this.currentTarget = null;
                 this._emptyScans = 0;
-                this.visitedMaps.push(mapId);
                 cleanerLog(reason || `[WORK] Zone already completed, skipping: ${mapId}`);
-                this._mapIndex++;
-                this._moveToConfiguredMap();
+                cleanerLog(`[AVA SHIFT] ${mapId} already finished`);
+                this._recordShiftAndAdvance(mapId);
+            },
+
+            _recordShiftAndAdvance(mapId) {
+                if (this._shiftAdvancePending) {
+                    return;
+                }
+                this._shiftAdvancePending = true;
+                this.busy = true;
+                const autoLoop = w.__AVA_AUTO_CLEAN_LOOP__;
+                const capture = autoLoop?.captureMapAvailability
+                    ? autoLoop.captureMapAvailability(mapId, {
+                        timeoutMs: SHIFT_COUNTDOWN_TIMEOUT_MS
+                    })
+                    : Promise.resolve(null);
+
+                Promise.resolve(capture).finally(() => {
+                    if (!this.running) {
+                        this._shiftAdvancePending = false;
+                        this.busy = false;
+                        return;
+                    }
+                    if (!this.visitedMaps.includes(mapId)) {
+                        this.visitedMaps.push(mapId);
+                    }
+                    this._shiftAdvancePending = false;
+                    this.busy = false;
+                    this._mapIndex++;
+                    this._moveToConfiguredMap();
+                });
             },
 
             _waitForWorkFinishedOrScan(mapId) {
@@ -5025,6 +5188,11 @@
                     cleanerLog("[AVA RECOVERY] Rescanning interrupted zone");
                     finishCrashRecovery();
                 }
+
+                w.__AVA_AUTO_CLEAN_LOOP__?.captureMapAvailability?.(mapId, {
+                    timeoutMs: 0,
+                    useFallback: false
+                });
 
                 this._scheduleScan(0);
             },
@@ -5683,10 +5851,8 @@
                     return;
                 }
 
-                this.visitedMaps.push(mapId);
                 cleanerLog(`Map complete: ${mapId}`);
-                this._mapIndex++;
-                this._moveToConfiguredMap();
+                this._recordShiftAndAdvance(mapId);
             },
 
             _getMaxAttemptsForTarget(target, targetId = null) {
@@ -6276,6 +6442,7 @@
     function initializeAutoCleanLoop() {
         const storageKey = "__AVA_AUTO_CLEAN_LOOP_ENABLED__";
         const modeStorageKey = "__AVA_AUTO_CLEAN_LOOP_MODE__";
+        const availabilityStorageKey = "__AVA_SHIFT_AVAILABILITY_V1__";
 
         const loop = {
             enabled: false,
@@ -6297,6 +6464,20 @@
             pollMs: 2000,
             recoveryInProgress: false,
             energyRecoveryInProgress: false,
+            mapAvailability: {
+                garbage: {
+                    lastCountdownSeconds: null,
+                    detectedAt: 0,
+                    readyAt: 0,
+                    source: null
+                },
+                garden: {
+                    lastCountdownSeconds: null,
+                    detectedAt: 0,
+                    readyAt: 0,
+                    source: null
+                }
+            },
             _timers: [],
 
             on() {
@@ -6361,7 +6542,167 @@
                         ? Math.max(0, this.nextReloadAt - Date.now())
                         : null,
                     recoveryInProgress: this.recoveryInProgress,
-                    energyRecoveryInProgress: this.energyRecoveryInProgress
+                    energyRecoveryInProgress: this.energyRecoveryInProgress,
+                    mapAvailability: this.shiftStatus().maps
+                };
+            },
+
+            serializableMapAvailability() {
+                const result = {};
+                for (const mapId of ["garbage", "garden"]) {
+                    const entry = this.mapAvailability[mapId] ?? {};
+                    result[mapId] = {
+                        readyAt: Number(entry.readyAt ?? 0),
+                        detectedAt: Number(entry.detectedAt ?? 0),
+                        lastCountdownSeconds: entry.lastCountdownSeconds != null &&
+                            Number.isFinite(Number(entry.lastCountdownSeconds))
+                            ? Number(entry.lastCountdownSeconds)
+                            : null,
+                        source: typeof entry.source === "string" ? entry.source : null
+                    };
+                }
+                return result;
+            },
+
+            restoreMapAvailability(value) {
+                const now = Date.now();
+                const oldestAllowed = now - 24 * 60 * 60 * 1000;
+                const newestAllowed = now + 24 * 60 * 60 * 1000;
+                for (const mapId of ["garbage", "garden"]) {
+                    const entry = value?.[mapId];
+                    const readyAt = Number(entry?.readyAt ?? 0);
+                    const detectedAt = Number(entry?.detectedAt ?? 0);
+                    if (
+                        !Number.isFinite(readyAt) ||
+                        !Number.isFinite(detectedAt) ||
+                        detectedAt < oldestAllowed ||
+                        readyAt > newestAllowed
+                    ) {
+                        continue;
+                    }
+                    this.mapAvailability[mapId] = {
+                        readyAt,
+                        detectedAt,
+                        lastCountdownSeconds: entry.lastCountdownSeconds != null &&
+                            Number.isFinite(Number(entry.lastCountdownSeconds))
+                            ? Number(entry.lastCountdownSeconds)
+                            : null,
+                        source: typeof entry.source === "string" ? entry.source : null
+                    };
+                }
+            },
+
+            _storeMapAvailability() {
+                try {
+                    localStorage.setItem(
+                        availabilityStorageKey,
+                        JSON.stringify(this.serializableMapAvailability())
+                    );
+                } catch {}
+                requestRecoveryCheckpointSave("shift-availability", true);
+            },
+
+            _fallbackDelayForMap(mapId) {
+                if (mapId === "garden") {
+                    return this.fullThenYardMs + this.yardThenFullMs;
+                }
+                return this.cycleMode === "yard"
+                    ? this.yardThenFullMs
+                    : this.fullThenYardMs;
+            },
+
+            async captureMapAvailability(mapId, options = {}) {
+                if (!["garbage", "garden"].includes(mapId)) {
+                    return null;
+                }
+                const timeoutMs = Math.max(0, Number(
+                    options.timeoutMs ?? SHIFT_COUNTDOWN_TIMEOUT_MS
+                ));
+                const useFallback = options.useFallback !== false;
+                const startedAt = performance.now();
+                let countdown = null;
+
+                do {
+                    countdown = findVisibleShiftCountdown();
+                    if (countdown || performance.now() - startedAt >= timeoutMs) {
+                        break;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 250));
+                } while (true);
+
+                if (countdown) {
+                    this.mapAvailability[mapId] = {
+                        lastCountdownSeconds: countdown.totalSeconds,
+                        detectedAt: countdown.detectedAt,
+                        readyAt: countdown.readyAt,
+                        source: "display-countdown"
+                    };
+                    console.log(`[AVA SHIFT] Countdown: ${countdown.text}`);
+                    console.log(
+                        `[AVA SHIFT] ${mapId} ready at ${new Date(countdown.readyAt).toLocaleTimeString()}`
+                    );
+                    this._storeMapAvailability();
+                    return countdown;
+                }
+
+                if (!useFallback) {
+                    return null;
+                }
+                const detectedAt = Date.now();
+                const readyAt = detectedAt + this._fallbackDelayForMap(mapId);
+                this.mapAvailability[mapId] = {
+                    lastCountdownSeconds: null,
+                    detectedAt,
+                    readyAt,
+                    source: "fallback-fixed-delay"
+                };
+                console.warn(`[AVA SHIFT] No countdown found for ${mapId}; using fallback delay`);
+                this._storeMapAvailability();
+                return null;
+            },
+
+            _nextReloadFromAvailability() {
+                const garbageReadyAt = Number(this.mapAvailability.garbage.readyAt ?? 0);
+                const gardenReadyAt = Number(this.mapAvailability.garden.readyAt ?? 0);
+                const validGarbage = garbageReadyAt > 0;
+                const validGarden = gardenReadyAt > 0;
+
+                if (this.cycleMode === "yard") {
+                    if (validGarbage && validGarden) {
+                        return Math.max(garbageReadyAt, gardenReadyAt);
+                    }
+                    return validGarbage
+                        ? garbageReadyAt
+                        : Date.now() + this.yardThenFullMs;
+                }
+
+                if (validGarbage && validGarden) {
+                    return Math.min(garbageReadyAt, gardenReadyAt);
+                }
+                if (validGarbage || validGarden) {
+                    return validGarbage ? garbageReadyAt : gardenReadyAt;
+                }
+                return Date.now() + this.fullThenYardMs;
+            },
+
+            shiftStatus() {
+                const now = Date.now();
+                const maps = {};
+                for (const mapId of ["garbage", "garden"]) {
+                    const entry = this.mapAvailability[mapId];
+                    maps[mapId] = {
+                        ...entry,
+                        readyInMs: entry.readyAt
+                            ? Math.max(0, entry.readyAt - now)
+                            : null
+                    };
+                }
+                return {
+                    maps,
+                    garbage: maps.garbage,
+                    garden: maps.garden,
+                    nextCycleMode: this.nextCycleMode,
+                    nextReloadAt: this.nextReloadAt
                 };
             },
 
@@ -6391,6 +6732,13 @@
                     if (stored === "yard" || stored === "full") {
                         this.cycleMode = stored;
                     }
+                } catch {}
+
+                try {
+                    const storedAvailability = JSON.parse(
+                        localStorage.getItem(availabilityStorageKey) ?? "null"
+                    );
+                    this.restoreMapAvailability(storedAvailability);
                 } catch {}
 
                 this._refreshCycleConfig();
@@ -6567,14 +6915,15 @@
                 this.completedAt = Date.now();
                 this._refreshCycleConfig();
                 this._storeCycleMode(this.nextCycleMode);
-                this.nextReloadAt = this.completedAt + this.idleMs;
+                this.nextReloadAt = this._nextReloadFromAvailability();
+                const waitMs = Math.max(0, this.nextReloadAt - Date.now());
                 requestRecoveryCheckpointSave("auto-cycle-idle", true);
 
                 console.log(
-                    `[AVA AUTO LOOP] Idle for ${Math.round(this.idleMs / 60000)} minutes before reload; next cycle: ${this.nextCycleMode}`
+                    `[AVA AUTO LOOP] Idle for ${Math.ceil(waitMs / 60000)} minutes before reload; next cycle: ${this.nextCycleMode}`
                 );
 
-                this._setTimer(() => this._reload(), this.idleMs);
+                this._setTimer(() => this._reload(), waitMs);
             },
 
             _reload() {
@@ -6604,6 +6953,28 @@
         } catch {}
 
         w.__AVA_AUTO_CLEAN_LOOP__ = loop;
+        w.__AVA_FIND_SHIFT_COUNTDOWN__ = function () {
+            const result = findVisibleShiftCountdown();
+            if (result) {
+                console.log("[AVA SHIFT] Visible countdown", {
+                    text: result.text,
+                    totalSeconds: result.totalSeconds,
+                    readyAt: result.readyAt,
+                    path: result.path
+                });
+            } else {
+                console.warn("[AVA SHIFT] No visible shift countdown found");
+            }
+            return result;
+        };
+        w.__AVA_SHIFT_STATUS__ = function () {
+            const status = loop.shiftStatus();
+            console.table({
+                garbage: status.garbage,
+                garden: status.garden
+            });
+            return status;
+        };
 
         if (loop.enabled) {
             console.log("[AVA AUTO LOOP] Script toggle is ON");
@@ -6676,6 +7047,7 @@
                     autoLoop.cycleMode = checkpoint.autoLoop.cycleMode === "yard" ? "yard" : "full";
                     autoLoop.nextCycleMode = checkpoint.autoLoop.nextCycleMode === "full" ? "full" : "yard";
                     autoLoop.maps = checkpoint.autoLoop.maps.slice();
+                    autoLoop.restoreMapAvailability(checkpoint.autoLoop.mapAvailability);
                     autoLoop.phase = "recovering";
                     crashRecoveryState.phase = "teleporting";
 
@@ -8301,7 +8673,7 @@
             },
             {
                 section: "Auto clean loop",
-                commands: "__AVA_AUTO_CLEAN_LOOP__.on(), __AVA_AUTO_CLEAN_LOOP__.off(), __AVA_AUTO_CLEAN_LOOP__.toggle(), __AVA_AUTO_CLEAN_LOOP__.status()"
+                commands: "__AVA_AUTO_CLEAN_LOOP__.on(), __AVA_AUTO_CLEAN_LOOP__.off(), __AVA_AUTO_CLEAN_LOOP__.toggle(), __AVA_AUTO_CLEAN_LOOP__.status(), __AVA_FIND_SHIFT_COUNTDOWN__(), __AVA_SHIFT_STATUS__()"
             },
             {
                 section: "Crash recovery",
