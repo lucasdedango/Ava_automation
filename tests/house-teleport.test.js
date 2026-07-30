@@ -26,3 +26,19 @@ test('public house helpers and saved obfuscated fields remain available', () => 
     assert.match(source, /w\.__AVA_GO_HOUSE__ = function/);
     assert.match(source, /w\.__AVA_RETURN_HOME__ = async function/);
 });
+
+test('room4 readiness accepts loaded refrigerator content when room metadata is null', () => {
+    const readiness = source.match(
+        /function houseRoomContentIsReady\(ownerId, roomId\) \{[\s\S]*?\n    \}\r?\n\r?\n    async function goHouse/
+    )?.[0] ?? '';
+    const teleport = source.match(
+        /async function goHouse\(ownerId, roomId = null\) \{[\s\S]*?\n    \}\r?\n\r?\n    function fridgeRow/
+    )?.[0] ?? '';
+
+    assert.match(readiness, /findFridgesInCurrentRoom\(\)/);
+    assert.match(readiness, /fridges\.length > 0/);
+    assert.match(readiness, /"room-content"/);
+    assert.match(teleport, /houseRoomContentIsReady\(ownerId, roomId\)/);
+    assert.match(teleport, /confirmedBy: roomReady\.confirmedBy/);
+    assert.match(teleport, /fridgeCount: roomReady\.fridges\.length/);
+});

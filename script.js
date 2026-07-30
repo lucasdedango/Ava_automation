@@ -1457,6 +1457,53 @@
         }
     }
 
+    /*
+     * Some HouseLocation builds leave Lmc and qmc unset after switchRoom().
+     * Loaded room models are a stronger functional signal for the configured
+     * refrigerator room than those optional obfuscated metadata fields.
+     */
+    function houseRoomContentIsReady(ownerId, roomId) {
+        const current =
+            w.penzville?.city?.Context?.currentLocation ??
+            null;
+
+        if (!current) {
+            return null;
+        }
+
+        if (String(current._gl ?? "") !== String(ownerId)) {
+            return null;
+        }
+
+        const roomIdMatches =
+            String(current.Lmc ?? "") === String(roomId);
+        const roomKeyMatches =
+            String(current.qmc ?? "") === `house_${ownerId}_${roomId}`;
+        let fridges = [];
+
+        try {
+            fridges = findFridgesInCurrentRoom();
+        } catch {}
+
+        const expectedContentLoaded =
+            String(roomId) === String(HOME_ROOM_ID) &&
+            fridges.length > 0;
+
+        if (!roomIdMatches && !roomKeyMatches && !expectedContentLoaded) {
+            return null;
+        }
+
+        return {
+            location: current,
+            fridges,
+            confirmedBy: roomIdMatches
+                ? "Lmc"
+                : roomKeyMatches
+                    ? "qmc"
+                    : "room-content"
+        };
+    }
+
     async function goHouse(ownerId, roomId = null) {
         if (ownerId == null || ownerId === "") {
             console.error("[AVA HOUSE] Invalid ownerId");
@@ -1540,33 +1587,11 @@
             };
         }
 
-        let roomReadySince = 0;
-        const roomReady = await waitForHouseState(() => {
-            if (!houseLocationIsActive(location, ownerId)) {
-                roomReadySince = 0;
-                return null;
-            }
-
-            const current =
-                w.penzville?.city?.Context?.currentLocation ??
-                null;
-
-            if (String(current?.Lmc ?? "") !== String(roomId)) {
-                roomReadySince = 0;
-                return null;
-            }
-
-            if (!roomReadySince) {
-                roomReadySince = performance.now();
-                return null;
-            }
-
-            if (performance.now() - roomReadySince < 750) {
-                return null;
-            }
-
-            return current;
-        });
+        const roomReady = await waitForHouseState(
+            () => houseRoomContentIsReady(ownerId, roomId),
+            30000,
+            250
+        );
 
         if (!roomReady) {
             console.error(
@@ -1580,12 +1605,17 @@
             };
         }
 
-        console.log(`[AVA HOUSE] Room ${String(roomId)} ready`);
+        console.log(
+            `[AVA HOUSE] Room ${String(roomId)} ready via ${roomReady.confirmedBy}`
+        );
+        console.log(`[AVA HOUSE] Found ${roomReady.fridges.length} refrigerators`);
         return {
             success: true,
             ownerId,
             roomId,
-            roomSwitched: true
+            roomSwitched: true,
+            confirmedBy: roomReady.confirmedBy,
+            fridgeCount: roomReady.fridges.length
         };
     }
 
@@ -2429,8 +2459,27 @@
         const homeResult =
             await goHouse(HOME_OWNER_ID, HOME_ROOM_ID);
 
-        if (!homeResult || homeResult.roomSwitched !== true) {
+        let loadedFridges = [];
+        try {
+            loadedFridges = findFridgesInCurrentRoom();
+        } catch {}
+        const houseContentReady =
+            loadedFridges.length > 0 &&
+            String(
+                w.penzville?.city?.Context?.currentLocation?._gl ?? ""
+            ) === String(HOME_OWNER_ID);
+
+        if (
+            (!homeResult || homeResult.roomSwitched !== true) &&
+            !houseContentReady
+        ) {
             return markEnergyRecoveryFailed(cleaner, "house-or-room-timeout");
+        }
+
+        if (houseContentReady && homeResult?.roomSwitched !== true) {
+            console.log(
+                `[AVA HOUSE] Continuing recovery with ${loadedFridges.length} loaded refrigerators`
+            );
         }
 
         energyRecoveryState.phase = "eating";

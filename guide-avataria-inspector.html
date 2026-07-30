@@ -177,6 +177,7 @@ await __AVA_RETURN_HOME__();</code></pre>
 await __AVA_EAT_FROM_FRIDGE__(objectId);
 await __AVA_EAT_AVAILABLE__(2);</code></pre>
       <p>Quand la boucle automatique manque d’énergie, elle mémorise la zone de travail, rejoint automatiquement la maison <code>921180938</code> dans <code>room4</code>, utilise deux réfrigérateurs distincts puis revient rescanner la zone interrompue. Si trop peu de réfrigérateurs sont prêts et que l’énergie reste insuffisante, la boucle se met en pause avec la raison <code>insufficient-ready-fridges</code> au lieu de revenir en boucle.</p>
+      <p class="note">Selon la version du client, <code>Lmc</code> et <code>qmc</code> peuvent rester à <code>null</code> après le changement de pièce. Pour <code>room4</code>, la présence de modèles <code>refrigerator3</code> appartenant à la bonne maison confirme alors fonctionnellement que le contenu de la pièce est chargé.</p>
     </section>
 
     <section id="objets" class="searchable expert-only"><h2>Inspecter les objets</h2>
