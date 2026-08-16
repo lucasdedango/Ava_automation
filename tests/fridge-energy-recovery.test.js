@@ -30,7 +30,8 @@ test('energy recovery goes home, eats twice, and returns through work teleport',
         /async function startEnergyRecovery\(cleaner, energy = null, restoredState = null\) \{[\s\S]*?\n    \}\r?\n\r?\n    \/\*/
     )?.[0] ?? '';
     assert.match(implementation, /goHouse\(HOME_OWNER_ID, HOME_ROOM_ID\)/);
-    assert.match(implementation, /loadedFridges = findFridgesInCurrentRoom\(\)/);
+    assert.match(implementation, /houseRoomContentIsReady\(HOME_OWNER_ID, HOME_ROOM_ID\)/);
+    assert.match(implementation, /loadedFridges =\s*loadedRoom\?\.fridges \?\? \[\]/);
     assert.match(implementation, /houseContentReady/);
     assert.match(implementation, /homeResult\.roomSwitched !== true/);
     assert.match(implementation, /await eatAvailable\(remainingCount\)/);
