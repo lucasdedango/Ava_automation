@@ -1462,7 +1462,7 @@
      * Loaded room models are a stronger functional signal for the configured
      * refrigerator room than those optional obfuscated metadata fields.
      */
-    function houseRoomContentIsReady(ownerId, roomId) {
+    function houseRoomContentIsReady(ownerId, roomId, expectedLocation = null) {
         const current =
             w.penzville?.city?.Context?.currentLocation ??
             null;
@@ -1471,7 +1471,16 @@
             return null;
         }
 
-        if (String(current._gl ?? "") !== String(ownerId)) {
+        /*
+         * The client can clear _gl together with Lmc/qmc while switchRoom()
+         * replaces the visible room content.  Object identity still proves
+         * that this is the HouseLocation instance created by goHouse().
+         */
+        const ownerMatches =
+            current === expectedLocation ||
+            String(current._gl ?? "") === String(ownerId);
+
+        if (!ownerMatches) {
             return null;
         }
 
@@ -1588,7 +1597,7 @@
         }
 
         const roomReady = await waitForHouseState(
-            () => houseRoomContentIsReady(ownerId, roomId),
+            () => houseRoomContentIsReady(ownerId, roomId, activeLocation),
             30000,
             250
         );
@@ -2459,15 +2468,12 @@
         const homeResult =
             await goHouse(HOME_OWNER_ID, HOME_ROOM_ID);
 
-        let loadedFridges = [];
-        try {
-            loadedFridges = findFridgesInCurrentRoom();
-        } catch {}
+        const loadedRoom =
+            houseRoomContentIsReady(HOME_OWNER_ID, HOME_ROOM_ID);
+        const loadedFridges =
+            loadedRoom?.fridges ?? [];
         const houseContentReady =
-            loadedFridges.length > 0 &&
-            String(
-                w.penzville?.city?.Context?.currentLocation?._gl ?? ""
-            ) === String(HOME_OWNER_ID);
+            loadedFridges.length > 0;
 
         if (
             (!homeResult || homeResult.roomSwitched !== true) &&

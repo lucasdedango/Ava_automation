@@ -29,7 +29,7 @@ test('public house helpers and saved obfuscated fields remain available', () => 
 
 test('room4 readiness accepts loaded refrigerator content when room metadata is null', () => {
     const readiness = source.match(
-        /function houseRoomContentIsReady\(ownerId, roomId\) \{[\s\S]*?\n    \}\r?\n\r?\n    async function goHouse/
+        /function houseRoomContentIsReady\(ownerId, roomId, expectedLocation = null\) \{[\s\S]*?\n    \}\r?\n\r?\n    async function goHouse/
     )?.[0] ?? '';
     const teleport = source.match(
         /async function goHouse\(ownerId, roomId = null\) \{[\s\S]*?\n    \}\r?\n\r?\n    function fridgeRow/
@@ -38,7 +38,8 @@ test('room4 readiness accepts loaded refrigerator content when room metadata is 
     assert.match(readiness, /findFridgesInCurrentRoom\(\)/);
     assert.match(readiness, /fridges\.length > 0/);
     assert.match(readiness, /"room-content"/);
-    assert.match(teleport, /houseRoomContentIsReady\(ownerId, roomId\)/);
+    assert.match(readiness, /current === expectedLocation/);
+    assert.match(teleport, /houseRoomContentIsReady\(ownerId, roomId, activeLocation\)/);
     assert.match(teleport, /confirmedBy: roomReady\.confirmedBy/);
     assert.match(teleport, /fridgeCount: roomReady\.fridges\.length/);
 });
